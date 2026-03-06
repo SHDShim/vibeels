@@ -24,7 +24,7 @@ from matplotlib.patches import Polygon, Rectangle
 from matplotlib.path import Path as MplPath
 from matplotlib.widgets import PolygonSelector, RectangleSelector
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .processing import (
     EV_TO_CMINV,
@@ -45,6 +45,24 @@ class LoadedData:
     image_path: Optional[str]
 
 
+@dataclass
+class SavedMapEntry:
+    show: bool
+    locked: bool
+    comment: str
+    roi_text: str
+    polygon_vertices: list[tuple[float, float]]
+    selection_mask: np.ndarray
+    display_image: np.ndarray
+    masked_image: np.ndarray
+    intensity_range: tuple[float, float]
+    energy_axis_raw: np.ndarray
+    fit_window: tuple[float, float]
+    selected_spectra: np.ndarray
+    energy_axis: np.ndarray
+    spectrum: np.ndarray
+
+
 class PlotCanvas(FigureCanvas):
     def __init__(self, subplot_spec=(1, 1), parent=None):
         self.figure = Figure(figsize=(7, 5), constrained_layout=True)
@@ -58,11 +76,15 @@ class PlotCanvas(FigureCanvas):
 
 
 class VibeelsWindow(QtWidgets.QMainWindow):
+    SETTINGS_GROUP = "paths"
+    LAST_DATA_DIR_KEY = "last_data_dir"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("vibeels")
         self.resize(1440, 900)
 
+        self.settings = QtCore.QSettings("vibeels", "vibeels")
         self.loaded: Optional[LoadedData] = None
         self.current_result: Optional[object] = None
         self.selector: Optional[object] = None
@@ -74,6 +96,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.map_polygon_vertices: Optional[list[tuple[float, float]]] = None
         self._map_intensity_min = 0.0
         self._map_intensity_max = 1.0
+        self.saved_map_entries: list[SavedMapEntry] = []
+        self._updating_saved_map_table = False
 
         self._build_ui()
         self._apply_default_ranges()
@@ -137,6 +161,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self._build_data_tab()
         self._build_roi_tab()
         self._build_calibration_tab()
+        self._build_saved_maps_tab()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def _build_data_tab(self):
         tab = QtWidgets.QWidget()
@@ -310,6 +336,50 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
         self.tabs.addTab(tab, "Calibration")
 
+    def _build_saved_maps_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        controls = QtWidgets.QHBoxLayout()
+        self.saved_update_plot_button = QtWidgets.QPushButton("Update plot")
+        self.saved_update_plot_button.clicked.connect(self._update_view_for_active_tab)
+        self.saved_add_current_button = QtWidgets.QPushButton("Add current")
+        self.saved_add_current_button.clicked.connect(self._add_current_map_entry)
+        self.normalize_saved_spectra_checkbox = QtWidgets.QCheckBox("Normalize spectra intensity")
+        self.normalize_saved_spectra_checkbox.toggled.connect(self._update_view_for_active_tab)
+        controls.addWidget(self.saved_update_plot_button)
+        controls.addWidget(self.saved_add_current_button)
+        controls.addWidget(self.normalize_saved_spectra_checkbox)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.saved_map_table = QtWidgets.QTableWidget(0, 4)
+        self.saved_map_table.setHorizontalHeaderLabels(["Show", "Lock", "Comment", "ROI coordinates"])
+        header = self.saved_map_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        self.saved_map_table.verticalHeader().setVisible(False)
+        self.saved_map_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.saved_map_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.saved_map_table.setAlternatingRowColors(True)
+        self.saved_map_table.itemChanged.connect(self._on_saved_map_item_changed)
+        self._set_saved_map_header_icons()
+        layout.addWidget(self.saved_map_table, 1)
+
+        self.tabs.addTab(tab, "Saved Maps")
+
+    def _set_saved_map_header_icons(self):
+        show_header = self.saved_map_table.horizontalHeaderItem(0)
+        lock_header = self.saved_map_table.horizontalHeaderItem(1)
+        show_icon = QtGui.QIcon.fromTheme("view-visible")
+        lock_icon = QtGui.QIcon.fromTheme("object-locked")
+        if not show_icon.isNull():
+            show_header.setIcon(show_icon)
+        if not lock_icon.isNull():
+            lock_header.setIcon(lock_icon)
+
     def _apply_default_ranges(self):
         self.energy_start_spin.setValue(150)
         self.energy_stop_spin.setValue(550)
@@ -321,11 +391,287 @@ class VibeelsWindow(QtWidgets.QMainWindow):
     def _log(self, message: str):
         self.status_box.appendPlainText(message)
 
+    def _make_checkbox_table_item(self, checked: bool) -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem()
+        item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsUserCheckable)
+        item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+        return item
+
+    def _current_map_roi_text(self) -> str:
+        if self.map_polygon_vertices:
+            return "; ".join(f"({x:.1f}, {y:.1f})" for x, y in self.map_polygon_vertices)
+        if isinstance(self.current_result, MapProcessingResult):
+            ys, xs = np.where(self.current_result.selection_mask)
+            if xs.size and ys.size:
+                return f"x={int(xs.min())}:{int(xs.max())}, y={int(ys.min())}:{int(ys.max())}"
+        return "-"
+
+    def _saved_map_entries_for_display(self) -> list[tuple[int, SavedMapEntry]]:
+        return [
+            (row, entry)
+            for row, entry in enumerate(self.saved_map_entries)
+            if entry.show
+        ]
+
+    def _saved_map_entry_color(self, row: int):
+        cmap = matplotlib.colormaps["tab10"]
+        return cmap(row % cmap.N)
+
+    def _saved_maps_tab_index(self) -> int:
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == "Saved Maps":
+                return index
+        return -1
+
+    def _saved_maps_tab_active(self) -> bool:
+        return self.tabs.currentIndex() == self._saved_maps_tab_index()
+
+    def _saved_entry_zlp_scale(self, entry: SavedMapEntry) -> float:
+        fit_mask = (entry.energy_axis >= entry.fit_window[0]) & (entry.energy_axis <= entry.fit_window[1])
+        if not np.any(fit_mask):
+            fit_mask = np.isfinite(entry.spectrum)
+        zlp_region = np.asarray(entry.spectrum[fit_mask], dtype=float)
+        if zlp_region.size == 0:
+            return 1.0
+        scale = float(np.max(np.abs(zlp_region)))
+        return scale if scale > 0 else 1.0
+
+    def _scaled_saved_entry_spectrum(self, entry: SavedMapEntry) -> np.ndarray:
+        spectrum = np.asarray(entry.spectrum, dtype=float)
+        if not self.normalize_saved_spectra_checkbox.isChecked():
+            return spectrum
+        return spectrum / self._saved_entry_zlp_scale(entry)
+
+    def _refresh_saved_map_table(self):
+        self._updating_saved_map_table = True
+        try:
+            self.saved_map_table.setRowCount(len(self.saved_map_entries))
+            for row, entry in enumerate(self.saved_map_entries):
+                self.saved_map_table.setItem(row, 0, self._make_checkbox_table_item(entry.show))
+                self.saved_map_table.setItem(row, 1, self._make_checkbox_table_item(entry.locked))
+
+                comment_item = QtWidgets.QTableWidgetItem(entry.comment)
+                comment_flags = QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
+                if not entry.locked:
+                    comment_flags |= QtCore.Qt.ItemIsEditable
+                comment_item.setFlags(comment_flags)
+                self.saved_map_table.setItem(row, 2, comment_item)
+
+                roi_item = QtWidgets.QTableWidgetItem(entry.roi_text)
+                roi_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                self.saved_map_table.setItem(row, 3, roi_item)
+            self.saved_map_table.resizeRowsToContents()
+        finally:
+            self._updating_saved_map_table = False
+
+    def _on_saved_map_item_changed(self, item: QtWidgets.QTableWidgetItem):
+        if self._updating_saved_map_table:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self.saved_map_entries):
+            return
+        entry = self.saved_map_entries[row]
+        if item.column() == 0:
+            entry.show = item.checkState() == QtCore.Qt.Checked
+        elif item.column() == 1:
+            entry.locked = item.checkState() == QtCore.Qt.Checked
+            self._refresh_saved_map_table()
+        elif item.column() == 2:
+            entry.comment = item.text()
+        self._update_view_for_active_tab()
+
+    def _add_current_map_entry(self):
+        if not isinstance(self.current_result, MapProcessingResult):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Map result required",
+                "Run a 2D map analysis before adding the current spectrum to Saved Maps.",
+            )
+            return
+        entry = SavedMapEntry(
+            show=True,
+            locked=False,
+            comment=f"Map {len(self.saved_map_entries) + 1}",
+            roi_text=self._current_map_roi_text(),
+            polygon_vertices=list(self.map_polygon_vertices or []),
+            selection_mask=np.asarray(self.current_result.selection_mask, dtype=bool).copy(),
+            display_image=np.asarray(self.current_result.display_image, dtype=float).copy(),
+            masked_image=np.asarray(self.current_result.masked_image, dtype=float).copy(),
+            intensity_range=self._map_intensity_range_values(),
+            energy_axis_raw=np.asarray(self.current_result.energy_axis_raw, dtype=float).copy(),
+            fit_window=self._fit_window(),
+            selected_spectra=np.asarray(self.current_result.selected_spectra, dtype=float).copy(),
+            energy_axis=np.asarray(self.current_result.energy_axis_calibrated, dtype=float).copy(),
+            spectrum=np.asarray(self.current_result.summed_spectrum, dtype=float).copy(),
+        )
+        self.saved_map_entries.append(entry)
+        self._refresh_saved_map_table()
+        self._log(f"Added saved map spectrum #{len(self.saved_map_entries)}.")
+        self._draw_initial_image()
+
+    def _update_saved_spectra_plot(self):
+        self.spectrum_canvas.figure.clear()
+        spectrum_ax = self.spectrum_canvas.figure.add_subplot(111)
+
+        visible_entries = self._saved_map_entries_for_display()
+        if not visible_entries:
+            spectrum_ax.text(0.5, 0.5, "No saved map spectra selected for display", ha="center", va="center")
+            spectrum_ax.set_axis_off()
+            self.spectrum_canvas.draw_idle()
+            return
+
+        normalize = self.normalize_saved_spectra_checkbox.isChecked()
+        for row, entry in visible_entries:
+            spectrum = self._scaled_saved_entry_spectrum(entry)
+            label = entry.comment.strip() or f"Map {row + 1}"
+            linewidth = 1.8 if entry.locked else 1.0
+            alpha = 1.0 if entry.locked else 0.85
+            spectrum_ax.plot(
+                entry.energy_axis,
+                spectrum,
+                linewidth=linewidth,
+                alpha=alpha,
+                color=self._saved_map_entry_color(row),
+                label=label,
+            )
+
+        spectrum_ax.set_xlabel("Energy loss (eV, ZLP corrected)")
+        spectrum_ax.set_ylabel("Normalized intensity" if normalize else "Intensity (a.u.)")
+        spectrum_ax.set_title("Saved map spectra")
+        spectrum_ax_top = spectrum_ax.secondary_xaxis(
+            "top",
+            functions=(lambda x: x * EV_TO_CMINV, lambda x: x / EV_TO_CMINV),
+        )
+        spectrum_ax_top.set_xlabel(r"Wavenumber (cm$^{-1}$)")
+        spectrum_ax.legend(loc="best", fontsize=8)
+        self.spectrum_canvas.draw_idle()
+
+    def _clear_saved_maps_preview(self):
+        self.image_canvas.figure.clear()
+        image_ax = self.image_canvas.figure.add_subplot(111)
+        image_ax.text(0.5, 0.5, "No saved maps selected for display", ha="center", va="center")
+        image_ax.set_axis_off()
+        self.image_canvas.draw_idle()
+
+        self.corrected_canvas.figure.clear()
+        corrected_ax = self.corrected_canvas.figure.add_subplot(111)
+        corrected_ax.text(0.5, 0.5, "No masked map preview", ha="center", va="center")
+        corrected_ax.set_axis_off()
+        self.corrected_canvas.draw_idle()
+
+        self.fit_canvas.figure.clear()
+        fit_ax = self.fit_canvas.figure.add_subplot(111)
+        fit_ax.text(0.5, 0.5, "No ZLP alignment preview", ha="center", va="center")
+        fit_ax.set_axis_off()
+        self.fit_canvas.draw_idle()
+
+        self.spectrum_canvas.figure.clear()
+        spectrum_ax = self.spectrum_canvas.figure.add_subplot(111)
+        spectrum_ax.text(0.5, 0.5, "No saved map spectra selected for display", ha="center", va="center")
+        spectrum_ax.set_axis_off()
+        self.spectrum_canvas.draw_idle()
+
+    def _preview_selected_saved_maps(self):
+        entries = self._saved_map_entries_for_display()
+        if not entries:
+            self._clear_saved_maps_preview()
+            return
+
+        self._detach_selector()
+        self.image_canvas.figure.clear()
+        image_ax = self.image_canvas.figure.add_subplot(111)
+        base_image = np.asarray(entries[0][1].display_image, dtype=float)
+        image_ax.imshow(base_image, cmap="inferno", origin="upper")
+        image_ax.set_title("Saved map ROI overlays")
+        image_ax.set_xlabel("")
+        image_ax.set_ylabel("")
+        for row, entry in entries:
+            color = self._saved_map_entry_color(row)
+            if entry.polygon_vertices:
+                image_ax.add_patch(
+                    Polygon(
+                        entry.polygon_vertices,
+                        closed=True,
+                        fill=False,
+                        edgecolor=color,
+                        linewidth=1.8,
+                    )
+                )
+        self.image_canvas.draw_idle()
+
+        self.corrected_canvas.figure.clear()
+        corrected_ax = self.corrected_canvas.figure.add_subplot(111)
+        combined_masked = np.full_like(entries[0][1].masked_image, np.nan, dtype=float)
+        for _, entry in entries:
+            combined_masked = np.where(np.isfinite(entry.masked_image), entry.masked_image, combined_masked)
+        masked = np.ma.masked_invalid(combined_masked)
+        corrected_ax.imshow(masked, cmap="inferno", origin="upper")
+        corrected_ax.set_title("Masked map intensities")
+        corrected_ax.set_xlabel("")
+        corrected_ax.set_ylabel("")
+        self.corrected_canvas.draw_idle()
+
+        self.fit_canvas.figure.clear()
+        fit_ax = self.fit_canvas.figure.add_subplot(111)
+        for row, entry in entries:
+            fit_mask = (
+                (entry.energy_axis_raw >= entry.fit_window[0])
+                & (entry.energy_axis_raw <= entry.fit_window[1])
+            )
+            for index, spectrum in enumerate(entry.selected_spectra[:, fit_mask]):
+                fit_ax.plot(
+                    entry.energy_axis_raw[fit_mask],
+                    spectrum,
+                    color=self._saved_map_entry_color(row),
+                    alpha=0.15,
+                    linewidth=0.7,
+                    label=(entry.comment.strip() or f"Map {row + 1}") if index == 0 else None,
+                )
+        fit_ax.axvline(
+            0.0,
+            color="royalblue",
+            linewidth=1.0,
+            linestyle=":",
+            label="alignment target",
+        )
+        fit_ax.set_title("ZLP alignment comparison")
+        fit_ax.set_xlabel("Energy loss (eV)")
+        fit_ax.set_ylabel("ZLP region")
+        fit_ax.legend(loc="best", fontsize=8)
+        self.fit_canvas.draw_idle()
+
+        self._update_saved_spectra_plot()
+
+    def _update_view_for_active_tab(self):
+        if self._saved_maps_tab_active():
+            self._preview_selected_saved_maps()
+            return
+        if self.current_result is not None:
+            self._render_result(self.current_result)
+            return
+        self._draw_initial_image()
+
+    def _on_tab_changed(self, _index: int):
+        self._update_view_for_active_tab()
+
+    def _initial_data_dir(self) -> str:
+        saved_dir = self.settings.value(f"{self.SETTINGS_GROUP}/{self.LAST_DATA_DIR_KEY}", "", type=str)
+        if saved_dir and Path(saved_dir).is_dir():
+            return saved_dir
+        return str(Path.home())
+
+    def _remember_data_dir(self, path: str | Path):
+        selected_path = Path(path).expanduser()
+        directory = selected_path if selected_path.is_dir() else selected_path.parent
+        if not str(directory):
+            return
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/{self.LAST_DATA_DIR_KEY}", str(directory))
+
     def _load_eels(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load EELS signal",
-            "",
+            self._initial_data_dir(),
             "DigitalMicrograph (*.dm3 *.dm4);;All files (*)",
         )
         if not path:
@@ -350,13 +696,14 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         if self.mode_combo.currentIndex() == 0:
             self._reset_map_histogram_controls()
         self._draw_initial_image()
+        self._remember_data_dir(path)
         self._log(f"Loaded EELS signal: {path}")
 
     def _load_image(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load reference image",
-            "",
+            self._initial_data_dir(),
             "DigitalMicrograph (*.dm3 *.dm4);;All files (*)",
         )
         if not path:
@@ -374,6 +721,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.loaded.image_path = path
         self.image_path_label.setText(path)
         self._draw_initial_image()
+        self._remember_data_dir(path)
         self._log(f"Loaded reference image: {path}")
 
     def _sync_ranges_to_loaded_data(self):
@@ -478,20 +826,36 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         z_max = self._map_intensity_min + (span * max_pos / 1000.0)
         return z_min, z_max
 
-    def _reset_map_histogram_controls(self):
+    def _set_map_mask_slider_values(self, z_min: float, z_max: float):
+        span = self._map_intensity_max - self._map_intensity_min
+        if span <= 0:
+            min_pos = 0
+            max_pos = 1000
+        else:
+            clamped_min = min(max(z_min, self._map_intensity_min), self._map_intensity_max)
+            clamped_max = min(max(z_max, self._map_intensity_min), self._map_intensity_max)
+            min_pos = int(round((clamped_min - self._map_intensity_min) / span * 1000.0))
+            max_pos = int(round((clamped_max - self._map_intensity_min) / span * 1000.0))
+        self.map_mask_min_slider.blockSignals(True)
+        self.map_mask_max_slider.blockSignals(True)
+        self.map_mask_min_slider.setValue(min_pos)
+        self.map_mask_max_slider.setValue(max_pos)
+        self.map_mask_min_slider.blockSignals(False)
+        self.map_mask_max_slider.blockSignals(False)
+
+    def _reset_map_histogram_controls(self, preserve_mask_range: bool = False):
         image = self._map_intensity_image()
         polygon_mask = self._current_polygon_mask()
         if image is None or polygon_mask is None or not polygon_mask.any():
             return
+        previous_min, previous_max = self._map_intensity_range_values()
         values = image[polygon_mask]
         self._map_intensity_min = float(np.min(values))
         self._map_intensity_max = float(np.max(values))
-        self.map_mask_min_slider.blockSignals(True)
-        self.map_mask_max_slider.blockSignals(True)
-        self.map_mask_min_slider.setValue(0)
-        self.map_mask_max_slider.setValue(1000)
-        self.map_mask_min_slider.blockSignals(False)
-        self.map_mask_max_slider.blockSignals(False)
+        if preserve_mask_range:
+            self._set_map_mask_slider_values(previous_min, previous_max)
+        else:
+            self._set_map_mask_slider_values(self._map_intensity_min, self._map_intensity_max)
         self._update_map_histogram()
 
     def _update_map_histogram(self):
@@ -542,12 +906,28 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         ax.set_ylabel("")
         self.corrected_canvas.draw_idle()
 
+    def _detach_selector(self):
+        if self.selector is None:
+            return
+        try:
+            self.selector.set_active(False)
+        except Exception:
+            pass
+        disconnect = getattr(self.selector, "disconnect_events", None)
+        if callable(disconnect):
+            try:
+                disconnect()
+            except Exception:
+                pass
+        self.selector = None
+
     def _draw_initial_image(self):
         preserve_view = self.loaded is not None and self.mode_combo.currentIndex() == 1
         if preserve_view and self.image_canvas.figure.axes:
             current_ax = self.image_canvas.figure.axes[0]
             self._image_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
 
+        self._detach_selector()
         self.image_canvas.figure.clear()
         ax = self.image_canvas.figure.add_subplot(111)
         if self.loaded is None:
@@ -623,7 +1003,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         if self.mode_combo.currentIndex() != 0:
             return
         self.map_polygon_vertices = [(float(x), float(y)) for x, y in verts]
-        self._reset_map_histogram_controls()
+        self._reset_map_histogram_controls(preserve_mask_range=True)
         self._draw_initial_image()
 
     def _on_rectangle_selected(self, eclick, erelease):
@@ -779,6 +1159,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
                     continue
                 if reply == QtWidgets.QMessageBox.Cancel:
                     return None
+            self._remember_data_dir(target_dir)
             return target_dir
 
     def _collect_export_arrays(self) -> dict[str, np.ndarray]:
@@ -1083,6 +1464,7 @@ plt.show()
         if isinstance(result, StackProcessingResult) and self.image_canvas.figure.axes:
             current_ax = self.image_canvas.figure.axes[0]
             self._image_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
+        self._detach_selector()
         self.image_canvas.figure.clear()
         image_ax = self.image_canvas.figure.add_subplot(111)
 
@@ -1190,26 +1572,50 @@ plt.show()
                 & (result.energy_axis_raw <= self.fit_stop_spin.value())
             )
             zlp_stack = result.selected_spectra[:, fit_mask]
-            for row in zlp_stack:
+            for index, row in enumerate(zlp_stack):
                 fit_ax.plot(
                     result.energy_axis_raw[fit_mask],
                     row,
                     color="0.5",
                     linewidth=0.6,
                     alpha=0.25,
+                    label="individually aligned spectra" if index == 0 else None,
                 )
-            fit_ax.plot(result.zero_loss_fit.fit_x, result.zero_loss_fit.fit_y, "k.", markersize=3, label="integrated")
-            fit_ax.plot(result.zero_loss_fit.fit_x, result.zero_loss_fit.best_fit, color="crimson", linewidth=1.2, label="fit")
             fit_ax.axvline(
-                result.zero_loss_fit.center_ev,
+                0.0,
                 color="royalblue",
                 linewidth=1.0,
+                linestyle=":",
+                label="per-spectrum alignment target",
+            )
+            fit_ax.plot(
+                result.zero_loss_fit.fit_x,
+                result.zero_loss_fit.fit_y,
+                "k.",
+                markersize=3,
+                label="summed after alignment",
+            )
+            fit_ax.plot(
+                result.zero_loss_fit.fit_x,
+                result.zero_loss_fit.best_fit,
+                color="crimson",
+                linewidth=1.2,
+                label="fit of aligned sum",
+            )
+            fit_ax.axvline(
+                result.zero_loss_fit.center_ev,
+                color="darkorange",
+                linewidth=1.0,
                 linestyle="--",
-                label=f"centroid = {result.zero_loss_fit.center_ev:.5f} eV",
+                label=f"residual centroid = {result.zero_loss_fit.center_ev:.5f} eV",
             )
         fit_ax.set_xlabel("Energy loss (eV)")
         fit_ax.set_ylabel("ZLP region")
-        fit_ax.set_title("ZLP, aligned")
+        fit_ax.set_title(
+            "ZLP, aligned"
+            if isinstance(result, StackProcessingResult)
+            else "ZLP, per-spectrum aligned then summed"
+        )
         fit_ax.legend(loc="lower left", fontsize=8)
 
         self.fit_canvas.draw_idle()

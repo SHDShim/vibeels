@@ -33,6 +33,7 @@ class MapProcessingResult:
     selection_mask: np.ndarray
     selected_pixel_count: int
     selected_spectra: np.ndarray
+    selected_zlp_centers_ev: np.ndarray
     summed_spectrum: np.ndarray
     energy_axis_raw: np.ndarray
     energy_axis_calibrated: np.ndarray
@@ -193,6 +194,21 @@ def align_spectra_1d(spectra: np.ndarray, max_shift: int = 64) -> np.ndarray:
     return aligned
 
 
+def align_spectrum_to_center(
+    energy_axis: np.ndarray,
+    spectrum: np.ndarray,
+    center_ev: float,
+) -> np.ndarray:
+    shifted_axis = np.asarray(energy_axis, dtype=float) + float(center_ev)
+    return np.interp(
+        shifted_axis,
+        np.asarray(energy_axis, dtype=float),
+        np.asarray(spectrum, dtype=float),
+        left=0.0,
+        right=0.0,
+    )
+
+
 def shift_2d_with_zeros(image: np.ndarray, shift_y: int, shift_x: int) -> np.ndarray:
     shifted = np.zeros_like(image)
 
@@ -264,9 +280,25 @@ def process_map_dataset(
     if selected_spectra.size == 0:
         raise ValueError("No pixels passed the current polygon ROI and intensity range.")
 
-    aligned_spectra = align_spectra_1d(selected_spectra.copy())
+    energy_axis = spectral_axis_from_signal(signal, selected_spectra.shape[1])
+    individual_fits = [
+        fit_zero_loss_peak(
+            energy_axis,
+            spectrum,
+            fit_window=fit_window,
+            guess_window=guess_window,
+        )
+        for spectrum in selected_spectra
+    ]
+    centers = np.asarray([fit.center_ev for fit in individual_fits], dtype=float)
+    aligned_spectra = np.asarray(
+        [
+            align_spectrum_to_center(energy_axis, spectrum, center_ev)
+            for spectrum, center_ev in zip(selected_spectra, centers, strict=False)
+        ],
+        dtype=float,
+    )
     summed_spectrum = aligned_spectra.sum(axis=0)
-    energy_axis = spectral_axis_from_signal(signal, summed_spectrum.shape[0])
     zlp_fit = fit_zero_loss_peak(
         energy_axis,
         summed_spectrum,
@@ -284,6 +316,7 @@ def process_map_dataset(
         selection_mask=selection_mask,
         selected_pixel_count=int(selection_mask.sum()),
         selected_spectra=np.asarray(aligned_spectra, dtype=float),
+        selected_zlp_centers_ev=centers,
         summed_spectrum=np.asarray(summed_spectrum, dtype=float),
         energy_axis_raw=np.asarray(energy_axis, dtype=float),
         energy_axis_calibrated=zlp_fit.calibrated_axis,

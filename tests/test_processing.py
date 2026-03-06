@@ -51,5 +51,7 @@ def test_process_map_dataset_selects_thresholded_roi():
 
     assert result.selected_pixel_count == 19
     assert result.summed_spectrum.shape == axis.shape
-    assert abs(result.zero_loss_fit.center_ev - 0.0085) < 0.01
+    assert result.selected_zlp_centers_ev.shape == (19,)
+    assert np.max(np.abs(result.selected_zlp_centers_ev - np.mean(result.selected_zlp_centers_ev))) < 0.01
+    assert abs(result.zero_loss_fit.center_ev) < 0.003
     assert result.masked_image.shape == (4, 5)
