@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibeels"
+dynamic = ["version"]
+description = "PyQt application for vibrational EELS spectrum extraction and zero-loss calibration"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Dan Shim" }
+]
+keywords = ["eels", "hyperspy", "pyqt", "spectroscopy", "vibrational-eels"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  "numpy",
+  "matplotlib",
+  "lmfit",
+  "hyperspy",
+  "PyQt5",
+]
+
+[project.urls]
+Homepage = "https://pypi.org/project/vibeels/"
+
+[project.scripts]
+vibeels = "vibeels.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "vibeels.version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["vibeels*"]
