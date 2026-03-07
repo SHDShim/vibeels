@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Qt5Agg")
 
 import numpy as np
+from matplotlib import ticker
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -35,6 +36,7 @@ from .processing import (
     process_map_dataset,
     process_snapshot_stack,
 )
+from .version import __version__
 
 
 @dataclass
@@ -47,6 +49,7 @@ class LoadedData:
 
 @dataclass
 class SavedMapEntry:
+    mode: str
     show: bool
     locked: bool
     comment: str
@@ -61,6 +64,14 @@ class SavedMapEntry:
     selected_spectra: np.ndarray
     energy_axis: np.ndarray
     spectrum: np.ndarray
+
+
+@dataclass
+class SavedStateRecord:
+    folder_name: str
+    saved_at: str
+    comment: str
+    directory: Path
 
 
 class PlotCanvas(FigureCanvas):
@@ -81,7 +92,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("vibeels")
+        self.setWindowTitle(f"vibeels {__version__}")
         self.resize(1440, 900)
 
         self.settings = QtCore.QSettings("vibeels", "vibeels")
@@ -98,9 +109,13 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self._map_intensity_max = 1.0
         self.saved_map_entries: list[SavedMapEntry] = []
         self._updating_saved_map_table = False
+        self.saved_state_records: list[SavedStateRecord] = []
+        self._updating_saved_state_table = False
 
         self._build_ui()
         self._apply_default_ranges()
+        self._update_reference_image_preview()
+        self._refresh_saved_state_records()
 
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -159,7 +174,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 2)
 
         self._build_data_tab()
-        self._build_roi_tab()
+        self._build_image_tab()
+        self._build_map_tab()
+        self._build_spot_tab()
         self._build_calibration_tab()
         self._build_saved_maps_tab()
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -168,49 +185,85 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QFormLayout(tab)
 
-        self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["2D map (y, x, energy)", "Snapshot stack (frame, vertical, energy)"])
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        self.mode_combo.setEnabled(False)
-
         self.eels_path_label = QtWidgets.QLabel("No EELS file loaded")
         self.eels_path_label.setWordWrap(True)
-        self.image_path_label = QtWidgets.QLabel("Optional image not loaded")
-        self.image_path_label.setWordWrap(True)
 
         load_eels = QtWidgets.QPushButton("Load EELS DM3/DM4")
         load_eels.clicked.connect(self._load_eels)
-        load_image = QtWidgets.QPushButton("Load Reference Image")
-        load_image.clicked.connect(self._load_image)
         refresh = QtWidgets.QPushButton("Process Current Settings")
         refresh.clicked.connect(self._process_current)
+        export_button = QtWidgets.QPushButton("Export NPY")
+        export_button.clicked.connect(self._save_results)
+        save_state = QtWidgets.QPushButton("Save status")
+        save_state.clicked.connect(self._save_session_state)
+        load_state = QtWidgets.QPushButton("Restore status")
+        load_state.clicked.connect(self._load_selected_session_state)
 
         self.shape_label = QtWidgets.QLabel("-")
-        self.snapshot_index_spin = QtWidgets.QSpinBox()
-        self.snapshot_index_spin.setMaximum(0)
-        self.snapshot_index_spin.valueChanged.connect(self._on_snapshot_index_changed)
-        self.snapshot_prev_button = QtWidgets.QPushButton("Previous Snapshot")
-        self.snapshot_prev_button.clicked.connect(self._show_previous_snapshot)
-        self.snapshot_next_button = QtWidgets.QPushButton("Next Snapshot")
-        self.snapshot_next_button.clicked.connect(self._show_next_snapshot)
 
-        layout.addRow("Mode", self.mode_combo)
         layout.addRow(load_eels)
         layout.addRow("EELS file", self.eels_path_label)
-        layout.addRow(load_image)
-        layout.addRow("Reference image", self.image_path_label)
         layout.addRow("Loaded shape", self.shape_label)
-        layout.addRow("Snapshot index", self.snapshot_index_spin)
-        layout.addRow(self.snapshot_prev_button)
-        layout.addRow(self.snapshot_next_button)
         layout.addRow(refresh)
+        layout.addRow(export_button)
+        state_buttons = QtWidgets.QHBoxLayout()
+        state_buttons.addWidget(save_state)
+        state_buttons.addWidget(load_state)
+        state_buttons.addStretch(1)
+        layout.addRow("Saved states", state_buttons)
+
+        self.saved_state_table = QtWidgets.QTableWidget(0, 3)
+        self.saved_state_table.setHorizontalHeaderLabels(["Folder", "Timestamp", "Comment"])
+        state_header = self.saved_state_table.horizontalHeader()
+        state_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        state_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        state_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        self.saved_state_table.verticalHeader().setVisible(False)
+        self.saved_state_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.saved_state_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.saved_state_table.setAlternatingRowColors(True)
+        self.saved_state_table.itemChanged.connect(self._on_saved_state_item_changed)
+        self.saved_state_table.setMinimumHeight(180)
+        layout.addRow(self.saved_state_table)
 
         self.tabs.addTab(tab, "Data")
 
-    def _build_roi_tab(self):
+    def _build_image_tab(self):
         tab = QtWidgets.QWidget()
-        layout = QtWidgets.QFormLayout(tab)
+        layout = QtWidgets.QVBoxLayout(tab)
 
+        controls = QtWidgets.QFormLayout()
+        load_image = QtWidgets.QPushButton("Load Reference Image")
+        load_image.clicked.connect(self._load_image)
+        self.image_path_label = QtWidgets.QLabel("Optional image not loaded")
+        self.image_path_label.setWordWrap(True)
+
+        self.reference_image_min_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.reference_image_max_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        for slider in [self.reference_image_min_slider, self.reference_image_max_slider]:
+            slider.setRange(0, 1000)
+            slider.valueChanged.connect(self._update_reference_image_preview)
+        self.reference_image_min_label = QtWidgets.QLabel("Z min: -")
+        self.reference_image_max_label = QtWidgets.QLabel("Z max: -")
+        self._reference_image_min = 0.0
+        self._reference_image_max = 1.0
+
+        controls.addRow(load_image)
+        controls.addRow("Reference image", self.image_path_label)
+        controls.addRow(self.reference_image_min_label)
+        controls.addRow(self.reference_image_min_slider)
+        controls.addRow(self.reference_image_max_label)
+        controls.addRow(self.reference_image_max_slider)
+        layout.addLayout(controls)
+
+        self.reference_image_canvas = PlotCanvas((1, 1), self)
+        self.reference_image_toolbar = NavigationToolbar(self.reference_image_canvas, self)
+        layout.addWidget(self.reference_image_toolbar)
+        layout.addWidget(self.reference_image_canvas, 1)
+
+        self.tabs.addTab(tab, "Image")
+
+    def _build_map_tab(self):
         self.energy_start_spin = QtWidgets.QSpinBox()
         self.energy_stop_spin = QtWidgets.QSpinBox()
         self.energy_start_spin.setMaximum(100000)
@@ -229,17 +282,6 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             widget.setMaximum(100000)
             widget.valueChanged.connect(self._update_selection_overlay)
 
-        self.stack_y0 = QtWidgets.QSpinBox()
-        self.stack_y1 = QtWidgets.QSpinBox()
-        self.frame_start = QtWidgets.QSpinBox()
-        self.frame_stop = QtWidgets.QSpinBox()
-        for widget in [self.stack_y0, self.stack_y1, self.frame_start, self.frame_stop]:
-            widget.setMaximum(100000)
-        self.stack_y0.valueChanged.connect(self._update_selection_overlay)
-        self.stack_y1.valueChanged.connect(self._update_selection_overlay)
-        self.frame_start.valueChanged.connect(self._draw_initial_image)
-        self.frame_stop.valueChanged.connect(self._draw_initial_image)
-
         self.enable_selector = QtWidgets.QCheckBox("Drag ROI / extraction band on image")
         self.enable_selector.setChecked(True)
         self.enable_selector.toggled.connect(self._sync_selector_state)
@@ -257,6 +299,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         process_button = QtWidgets.QPushButton("Apply ROI / Alignment")
         process_button.clicked.connect(self._process_current)
 
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QFormLayout(tab)
+
         self.map_mode_widgets = [
             self.energy_start_spin,
             self.energy_stop_spin,
@@ -269,12 +314,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.map_hist_canvas,
             self.map_mask_min_label,
             self.map_mask_max_label,
-        ]
-        self.snapshot_mode_widgets = [
-            self.stack_y0,
-            self.stack_y1,
-            self.frame_start,
-            self.frame_stop,
+            self.enable_selector,
         ]
 
         layout.addRow("Map energy start", self.energy_start_spin)
@@ -289,13 +329,55 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         layout.addRow(self.map_mask_max_label)
         layout.addRow(self.map_mask_max_slider)
         layout.addRow(self.map_hist_canvas)
+        layout.addRow(process_button)
+
+        self.map_tab_index = self.tabs.addTab(tab, "2D Map")
+
+    def _build_spot_tab(self):
+        self.stack_y0 = QtWidgets.QSpinBox()
+        self.stack_y1 = QtWidgets.QSpinBox()
+        self.frame_start = QtWidgets.QSpinBox()
+        self.frame_stop = QtWidgets.QSpinBox()
+        self.snapshot_index_spin = QtWidgets.QSpinBox()
+        self.snapshot_index_spin.setMaximum(0)
+        self.snapshot_index_spin.valueChanged.connect(self._on_snapshot_index_changed)
+        self.snapshot_prev_button = QtWidgets.QPushButton("Previous Snapshot")
+        self.snapshot_prev_button.clicked.connect(self._show_previous_snapshot)
+        self.snapshot_next_button = QtWidgets.QPushButton("Next Snapshot")
+        self.snapshot_next_button.clicked.connect(self._show_next_snapshot)
+        for widget in [self.stack_y0, self.stack_y1, self.frame_start, self.frame_stop]:
+            widget.setMaximum(100000)
+        self.stack_y0.valueChanged.connect(self._update_selection_overlay)
+        self.stack_y1.valueChanged.connect(self._update_selection_overlay)
+        self.frame_start.valueChanged.connect(self._draw_initial_image)
+        self.frame_stop.valueChanged.connect(self._draw_initial_image)
+
+        process_button = QtWidgets.QPushButton("Apply ROI / Alignment")
+        process_button.clicked.connect(self._process_current)
+
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QFormLayout(tab)
+
+        self.snapshot_mode_widgets = [
+            self.stack_y0,
+            self.stack_y1,
+            self.frame_start,
+            self.frame_stop,
+            self.snapshot_index_spin,
+            self.snapshot_prev_button,
+            self.snapshot_next_button,
+        ]
+
+        layout.addRow("Snapshot index", self.snapshot_index_spin)
+        layout.addRow(self.snapshot_prev_button)
+        layout.addRow(self.snapshot_next_button)
         layout.addRow("Detector y start", self.stack_y0)
         layout.addRow("Detector y stop", self.stack_y1)
         layout.addRow("Snapshot start", self.frame_start)
         layout.addRow("Snapshot stop", self.frame_stop)
         layout.addRow(process_button)
 
-        self.tabs.addTab(tab, "ROI + Align")
+        self.spot_tab_index = self.tabs.addTab(tab, "1D Spot")
 
     def _build_calibration_tab(self):
         tab = QtWidgets.QWidget()
@@ -321,8 +403,6 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.axis_span_label = QtWidgets.QLabel("-")
         process_button = QtWidgets.QPushButton("Run Zero-Loss Calibration")
         process_button.clicked.connect(self._process_current)
-        save_button = QtWidgets.QPushButton("Save Results")
-        save_button.clicked.connect(self._save_results)
 
         layout.addRow("Fit start (eV)", self.fit_start_spin)
         layout.addRow("Fit stop (eV)", self.fit_stop_spin)
@@ -332,7 +412,6 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         layout.addRow("Selected spectra", self.pixel_count_label)
         layout.addRow("Calibrated axis", self.axis_span_label)
         layout.addRow(process_button)
-        layout.addRow(save_button)
 
         self.tabs.addTab(tab, "Calibration")
 
@@ -344,17 +423,20 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.saved_update_plot_button = QtWidgets.QPushButton("Update plot")
         self.saved_update_plot_button.clicked.connect(self._update_view_for_active_tab)
         self.saved_add_current_button = QtWidgets.QPushButton("Add current")
-        self.saved_add_current_button.clicked.connect(self._add_current_map_entry)
+        self.saved_add_current_button.clicked.connect(self._add_current_entry)
+        self.saved_remove_selected_button = QtWidgets.QPushButton("Remove selected")
+        self.saved_remove_selected_button.clicked.connect(self._remove_selected_saved_entries)
         self.normalize_saved_spectra_checkbox = QtWidgets.QCheckBox("Normalize spectra intensity")
         self.normalize_saved_spectra_checkbox.toggled.connect(self._update_view_for_active_tab)
         controls.addWidget(self.saved_update_plot_button)
         controls.addWidget(self.saved_add_current_button)
+        controls.addWidget(self.saved_remove_selected_button)
         controls.addWidget(self.normalize_saved_spectra_checkbox)
         controls.addStretch(1)
         layout.addLayout(controls)
 
         self.saved_map_table = QtWidgets.QTableWidget(0, 4)
-        self.saved_map_table.setHorizontalHeaderLabels(["Show", "Lock", "Comment", "ROI coordinates"])
+        self.saved_map_table.setHorizontalHeaderLabels(["👁", "🔒", "Comment", "ROI coordinates"])
         header = self.saved_map_table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
@@ -368,17 +450,13 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self._set_saved_map_header_icons()
         layout.addWidget(self.saved_map_table, 1)
 
-        self.tabs.addTab(tab, "Saved Maps")
+        self.tabs.addTab(tab, "Saved")
 
     def _set_saved_map_header_icons(self):
         show_header = self.saved_map_table.horizontalHeaderItem(0)
         lock_header = self.saved_map_table.horizontalHeaderItem(1)
-        show_icon = QtGui.QIcon.fromTheme("view-visible")
-        lock_icon = QtGui.QIcon.fromTheme("object-locked")
-        if not show_icon.isNull():
-            show_header.setIcon(show_icon)
-        if not lock_icon.isNull():
-            lock_header.setIcon(lock_icon)
+        show_header.setText("👁")
+        lock_header.setText("🔒")
 
     def _apply_default_ranges(self):
         self.energy_start_spin.setValue(150)
@@ -406,6 +484,42 @@ class VibeelsWindow(QtWidgets.QMainWindow):
                 return f"x={int(xs.min())}:{int(xs.max())}, y={int(ys.min())}:{int(ys.max())}"
         return "-"
 
+    def _current_spot_roi_text(self) -> str:
+        return (
+            f"y={self.stack_y0.value()}:{self.stack_y1.value()}, "
+            f"frame={self.frame_start.value()}:{self.frame_stop.value()}, "
+            f"snapshot={self.snapshot_index_spin.value()}"
+        )
+
+    def _current_spot_roi_polygon(self, width: int) -> list[tuple[float, float]]:
+        x_max = max(0.0, float(width - 1))
+        y0 = float(self.stack_y0.value())
+        y1 = float(self.stack_y1.value())
+        return [(0.0, y0), (x_max, y0), (x_max, y1), (0.0, y1)]
+
+    def _saved_entry_masked_image_for_display(self, entry: SavedMapEntry) -> np.ndarray:
+        masked = np.asarray(entry.masked_image, dtype=float)
+        display = np.asarray(entry.display_image, dtype=float)
+        if masked.shape == display.shape:
+            return masked
+        if entry.mode != "spot" or display.ndim != 2:
+            return masked
+
+        full = np.full(display.shape, np.nan, dtype=float)
+        selection_mask = np.asarray(entry.selection_mask, dtype=bool)
+        if selection_mask.shape != display.shape:
+            return full
+
+        active_rows = np.where(selection_mask.any(axis=1))[0]
+        if active_rows.size == 0:
+            return full
+        row_start = int(active_rows.min())
+        row_stop = min(row_start + masked.shape[0], full.shape[0])
+        col_stop = min(masked.shape[1], full.shape[1]) if masked.ndim == 2 else 0
+        if masked.ndim == 2 and row_stop > row_start and col_stop > 0:
+            full[row_start:row_stop, :col_stop] = masked[: row_stop - row_start, :col_stop]
+        return full
+
     def _saved_map_entries_for_display(self) -> list[tuple[int, SavedMapEntry]]:
         return [
             (row, entry)
@@ -419,12 +533,175 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
     def _saved_maps_tab_index(self) -> int:
         for index in range(self.tabs.count()):
-            if self.tabs.tabText(index) == "Saved Maps":
+            if self.tabs.tabText(index) == "Saved":
                 return index
         return -1
 
     def _saved_maps_tab_active(self) -> bool:
         return self.tabs.currentIndex() == self._saved_maps_tab_index()
+
+    def _analysis_root_dir(self) -> Path:
+        if self.loaded is not None and self.loaded.eels_path:
+            return Path(self.loaded.eels_path).expanduser().resolve().parent / "vibeels-analysis"
+        return Path.cwd() / "vibeels-analysis"
+
+    def _state_metadata_path(self, directory: Path) -> Path:
+        return directory / "state.json"
+
+    def _state_arrays_path(self, directory: Path) -> Path:
+        return directory / "state_arrays.npz"
+
+    def _current_filename_label(self) -> str:
+        if self.loaded is not None and self.loaded.eels_path:
+            return Path(self.loaded.eels_path).name
+        return "Spectrum"
+
+    def _current_reference_image_data(self) -> Optional[np.ndarray]:
+        if self.loaded is None or self.loaded.image_signal is None:
+            return None
+        data = np.asarray(self.loaded.image_signal.data)
+        if data.ndim == 2:
+            return np.asarray(data, dtype=float)
+        if data.ndim > 2:
+            squeezed = np.squeeze(data)
+            if squeezed.ndim == 2:
+                return np.asarray(squeezed, dtype=float)
+        return None
+
+    def _reference_image_for_map_overlay(self) -> Optional[np.ndarray]:
+        if self.loaded is None or self._current_mode_index() != 0:
+            return None
+        reference_image = self._current_reference_image_data()
+        if reference_image is None or reference_image.ndim != 2:
+            return None
+        map_image = self._map_intensity_image()
+        if map_image is None or reference_image.shape != map_image.shape:
+            return None
+        return reference_image
+
+    def _reset_reference_image_controls(self):
+        image = self._current_reference_image_data()
+        if image is None or image.size == 0:
+            self._reference_image_min = 0.0
+            self._reference_image_max = 1.0
+        else:
+            self._reference_image_min = float(np.nanmin(image))
+            self._reference_image_max = float(np.nanmax(image))
+        self.reference_image_min_slider.blockSignals(True)
+        self.reference_image_max_slider.blockSignals(True)
+        self.reference_image_min_slider.setValue(0)
+        self.reference_image_max_slider.setValue(1000)
+        self.reference_image_min_slider.blockSignals(False)
+        self.reference_image_max_slider.blockSignals(False)
+        self._update_reference_image_preview()
+
+    def _reference_image_range_values(self) -> tuple[float, float]:
+        min_pos = self.reference_image_min_slider.value()
+        max_pos = self.reference_image_max_slider.value()
+        if min_pos > max_pos:
+            min_pos, max_pos = max_pos, min_pos
+        span = self._reference_image_max - self._reference_image_min
+        if span <= 0:
+            return self._reference_image_min, self._reference_image_max
+        z_min = self._reference_image_min + (span * min_pos / 1000.0)
+        z_max = self._reference_image_min + (span * max_pos / 1000.0)
+        return z_min, z_max
+
+    def _update_reference_image_preview(self):
+        self.reference_image_canvas.figure.clear()
+        ax = self.reference_image_canvas.figure.add_subplot(111)
+        image = self._current_reference_image_data()
+        if image is None:
+            ax.text(0.5, 0.5, "Load a reference image to preview it here", ha="center", va="center")
+            ax.set_axis_off()
+            self.reference_image_min_label.setText("Z min: -")
+            self.reference_image_max_label.setText("Z max: -")
+            self.reference_image_canvas.draw_idle()
+            return
+        z_min, z_max = self._reference_image_range_values()
+        ax.imshow(image, cmap="gray", origin="upper", vmin=z_min, vmax=z_max)
+        ax.set_title("Reference image")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        self.reference_image_min_label.setText(f"Z min: {z_min:.2f}")
+        self.reference_image_max_label.setText(f"Z max: {z_max:.2f}")
+        self.reference_image_canvas.draw_idle()
+
+    def _refresh_saved_state_records(self):
+        root = self._analysis_root_dir()
+        records: list[SavedStateRecord] = []
+        if root.exists():
+            for child in sorted(
+                root.iterdir(),
+                key=lambda path: int(path.name) if path.name.isdigit() else -1,
+                reverse=True,
+            ):
+                if not child.is_dir() or not child.name.isdigit():
+                    continue
+                metadata_path = self._state_metadata_path(child)
+                if not metadata_path.exists():
+                    continue
+                try:
+                    metadata = json.loads(metadata_path.read_text())
+                except Exception:
+                    continue
+                records.append(
+                    SavedStateRecord(
+                        folder_name=child.name,
+                        saved_at=str(metadata.get("saved_at", "")),
+                        comment=str(metadata.get("comment", "")),
+                        directory=child,
+                    )
+                )
+        self.saved_state_records = records
+        self._refresh_saved_state_table()
+
+    def _refresh_saved_state_table(self):
+        self._updating_saved_state_table = True
+        try:
+            self.saved_state_table.setRowCount(len(self.saved_state_records))
+            for row, record in enumerate(self.saved_state_records):
+                folder_item = QtWidgets.QTableWidgetItem(record.folder_name)
+                folder_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                self.saved_state_table.setItem(row, 0, folder_item)
+
+                timestamp_item = QtWidgets.QTableWidgetItem(record.saved_at)
+                timestamp_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                self.saved_state_table.setItem(row, 1, timestamp_item)
+
+                comment_item = QtWidgets.QTableWidgetItem(record.comment)
+                comment_item.setFlags(
+                    QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEditable
+                )
+                self.saved_state_table.setItem(row, 2, comment_item)
+            self.saved_state_table.resizeRowsToContents()
+        finally:
+            self._updating_saved_state_table = False
+
+    def _on_saved_state_item_changed(self, item: QtWidgets.QTableWidgetItem):
+        if self._updating_saved_state_table or item.column() != 2:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self.saved_state_records):
+            return
+        record = self.saved_state_records[row]
+        metadata_path = self._state_metadata_path(record.directory)
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except Exception:
+            metadata = {}
+        metadata["comment"] = item.text()
+        metadata_path.write_text(json.dumps(metadata, indent=2))
+        record.comment = item.text()
+
+    def _next_saved_state_dir(self) -> Path:
+        root = self._analysis_root_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        existing = {int(path.name) for path in root.iterdir() if path.is_dir() and path.name.isdigit()}
+        index = 0
+        while index in existing:
+            index += 1
+        return root / str(index)
 
     def _saved_entry_zlp_scale(self, entry: SavedMapEntry) -> float:
         fit_mask = (entry.energy_axis >= entry.fit_window[0]) & (entry.energy_axis <= entry.fit_window[1])
@@ -441,6 +718,322 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         if not self.normalize_saved_spectra_checkbox.isChecked():
             return spectrum
         return spectrum / self._saved_entry_zlp_scale(entry)
+
+    def _curve_fwhm(self, x_values: np.ndarray, y_values: np.ndarray) -> float:
+        x_values = np.asarray(x_values, dtype=float)
+        y_values = np.asarray(y_values, dtype=float)
+        if x_values.size < 2 or y_values.size < 2:
+            return 0.0
+        peak = float(np.max(y_values))
+        if peak <= 0:
+            return 0.0
+        half_max = peak / 2.0
+        mask = y_values >= half_max
+        if not np.any(mask):
+            return 0.0
+        return float(x_values[mask][-1] - x_values[mask][0])
+
+    def _format_colorbar_scientific(self, colorbar):
+        formatter = ticker.ScalarFormatter(useMathText=True)
+        formatter.set_powerlimits((0, 0))
+        colorbar.formatter = formatter
+        colorbar.update_ticks()
+
+    def _serialize_saved_map_entries(self) -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
+        metadata_entries: list[dict[str, object]] = []
+        arrays: dict[str, np.ndarray] = {}
+        for index, entry in enumerate(self.saved_map_entries):
+            prefix = f"saved_map_{index}"
+            metadata_entries.append(
+                {
+                    "mode": entry.mode,
+                    "show": entry.show,
+                    "locked": entry.locked,
+                    "comment": entry.comment,
+                    "roi_text": entry.roi_text,
+                    "polygon_vertices": entry.polygon_vertices,
+                    "intensity_range": list(entry.intensity_range),
+                    "fit_window": list(entry.fit_window),
+                }
+            )
+            arrays[f"{prefix}_selection_mask"] = np.asarray(entry.selection_mask, dtype=bool)
+            arrays[f"{prefix}_display_image"] = np.asarray(entry.display_image, dtype=float)
+            arrays[f"{prefix}_masked_image"] = np.asarray(entry.masked_image, dtype=float)
+            arrays[f"{prefix}_energy_axis_raw"] = np.asarray(entry.energy_axis_raw, dtype=float)
+            arrays[f"{prefix}_selected_spectra"] = np.asarray(entry.selected_spectra, dtype=float)
+            arrays[f"{prefix}_energy_axis"] = np.asarray(entry.energy_axis, dtype=float)
+            arrays[f"{prefix}_spectrum"] = np.asarray(entry.spectrum, dtype=float)
+        return metadata_entries, arrays
+
+    def _deserialize_saved_map_entries(self, metadata_entries: list[dict[str, object]], arrays) -> list[SavedMapEntry]:
+        entries: list[SavedMapEntry] = []
+        for index, metadata in enumerate(metadata_entries):
+            prefix = f"saved_map_{index}"
+            entries.append(
+                SavedMapEntry(
+                    mode=str(metadata.get("mode", "map")),
+                    show=bool(metadata.get("show", True)),
+                    locked=bool(metadata.get("locked", False)),
+                    comment=str(metadata.get("comment", "")),
+                    roi_text=str(metadata.get("roi_text", "-")),
+                    polygon_vertices=[
+                        (float(x), float(y))
+                        for x, y in metadata.get("polygon_vertices", [])
+                    ],
+                    selection_mask=np.asarray(arrays[f"{prefix}_selection_mask"], dtype=bool),
+                    display_image=np.asarray(arrays[f"{prefix}_display_image"], dtype=float),
+                    masked_image=np.asarray(arrays[f"{prefix}_masked_image"], dtype=float),
+                    intensity_range=tuple(float(v) for v in metadata.get("intensity_range", [0.0, 0.0])),
+                    energy_axis_raw=np.asarray(arrays[f"{prefix}_energy_axis_raw"], dtype=float),
+                    fit_window=tuple(float(v) for v in metadata.get("fit_window", [-0.05, 0.05])),
+                    selected_spectra=np.asarray(arrays[f"{prefix}_selected_spectra"], dtype=float),
+                    energy_axis=np.asarray(arrays[f"{prefix}_energy_axis"], dtype=float),
+                    spectrum=np.asarray(arrays[f"{prefix}_spectrum"], dtype=float),
+                )
+            )
+        return entries
+
+    def _current_state_metadata(self) -> dict[str, object]:
+        return {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "comment": "",
+            "mode_index": self._current_mode_index(),
+            "eels_path": self.loaded.eels_path if self.loaded else "",
+            "image_path": self.loaded.image_path if self.loaded else "",
+            "energy_range": [self.energy_start_spin.value(), self.energy_stop_spin.value()],
+            "map_mask_slider": [self.map_mask_min_slider.value(), self.map_mask_max_slider.value()],
+            "snapshot_vertical_range": [self.stack_y0.value(), self.stack_y1.value()],
+            "snapshot_frame_range": [self.frame_start.value(), self.frame_stop.value()],
+            "snapshot_index": self.snapshot_index_spin.value(),
+            "fit_window": [self.fit_start_spin.value(), self.fit_stop_spin.value()],
+            "guess_window": [self.guess_start_spin.value(), self.guess_stop_spin.value()],
+            "map_polygon_vertices": self.map_polygon_vertices or [],
+            "normalize_saved_spectra": self.normalize_saved_spectra_checkbox.isChecked(),
+        }
+
+    def _build_state_repro_script(self) -> str:
+        return '''from pathlib import Path
+
+import json
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.patches import Polygon
+
+
+state_dir = Path(__file__).resolve().parent
+metadata = json.loads((state_dir / "state.json").read_text())
+arrays = np.load(state_dir / "state_arrays.npz")
+
+saved_maps = metadata.get("saved_map_entries", [])
+shown = [(index, entry) for index, entry in enumerate(saved_maps) if entry.get("show", True)]
+
+fig = plt.figure(figsize=(14, 8), constrained_layout=True)
+gs = fig.add_gridspec(2, 3)
+
+ax_roi = fig.add_subplot(gs[0, 0])
+ax_mask = fig.add_subplot(gs[0, 1])
+ax_zlp = fig.add_subplot(gs[0, 2])
+ax_spec = fig.add_subplot(gs[1, :])
+
+if shown:
+    first_prefix = f"saved_map_{shown[0][0]}"
+    base_image = np.asarray(arrays[f"{first_prefix}_display_image"], dtype=float)
+    ax_roi.imshow(base_image, cmap="inferno", origin="upper")
+    ax_roi.set_title("ROI")
+
+    combined_mask = np.full_like(np.asarray(arrays[f"{first_prefix}_masked_image"], dtype=float), np.nan, dtype=float)
+    for index, entry in shown:
+        prefix = f"saved_map_{index}"
+        color = plt.cm.tab10(index % 10)
+        vertices = [(float(x), float(y)) for x, y in entry.get("polygon_vertices", [])]
+        if vertices:
+            ax_roi.add_patch(Polygon(vertices, closed=True, fill=False, edgecolor=color, linewidth=1.8))
+        masked = np.asarray(arrays[f"{prefix}_masked_image"], dtype=float)
+        combined_mask = np.where(np.isfinite(masked), masked, combined_mask)
+
+        energy_axis = np.asarray(arrays[f"{prefix}_energy_axis"], dtype=float)
+        spectrum = np.asarray(arrays[f"{prefix}_spectrum"], dtype=float)
+        ax_spec.plot(energy_axis, spectrum, color=color, linewidth=1.2, label=entry.get("comment") or f"Map {index + 1}")
+
+        raw_axis = np.asarray(arrays[f"{prefix}_energy_axis_raw"], dtype=float)
+        selected = np.asarray(arrays[f"{prefix}_selected_spectra"], dtype=float)
+        fit_window = entry.get("fit_window", [-0.05, 0.05])
+        fit_mask = (raw_axis >= fit_window[0]) & (raw_axis <= fit_window[1])
+        for row_idx, row in enumerate(selected[:, fit_mask]):
+            ax_zlp.plot(
+                raw_axis[fit_mask],
+                row,
+                color=color,
+                alpha=0.15,
+                linewidth=0.7,
+                label=(entry.get("comment") or f"Map {index + 1}") if row_idx == 0 else None,
+            )
+
+    ax_mask.imshow(np.ma.masked_invalid(combined_mask), cmap="inferno", origin="upper")
+    ax_mask.set_title("Masked ROI")
+    ax_zlp.axvline(0.0, color="royalblue", linestyle=":", linewidth=1.0, label="alignment target")
+    ax_zlp.set_title("ZLP")
+    ax_zlp.set_xlabel("Energy loss (eV)")
+    ax_zlp.set_ylabel("ZLP region")
+    ax_zlp.legend(loc="best", fontsize=8)
+    ax_spec.set_title(Path(metadata.get("eels_path", "")).name or "Spectrum")
+    ax_spec.set_xlabel("Energy loss (eV, ZLP corrected)")
+    ax_spec.set_ylabel("Intensity (a.u.)")
+    ax_spec.legend(loc="best", fontsize=8)
+else:
+    for ax, title, text in [
+        (ax_roi, "ROI", "No saved entries selected for display"),
+        (ax_mask, "Masked ROI", "No masked ROI preview"),
+        (ax_zlp, "ZLP", "No ZLP preview"),
+        (ax_spec, "Spectrum", "No saved spectra selected for display"),
+    ]:
+        ax.set_title(title)
+        ax.text(0.5, 0.5, text, ha="center", va="center")
+        ax.set_axis_off()
+
+plt.show()
+'''
+
+    def _write_saved_state_xy_files(self, state_dir: Path):
+        if self.current_result is not None:
+            current_xy = np.column_stack(
+                [
+                    np.asarray(self.current_result.energy_axis_calibrated, dtype=float),
+                    np.asarray(self.current_result.summed_spectrum, dtype=float),
+                ]
+            )
+            np.savetxt(state_dir / "current_spectrum.xy", current_xy, header="x y", comments="")
+
+        for index, entry in enumerate(self.saved_map_entries):
+            spectrum_xy = np.column_stack(
+                [
+                    np.asarray(entry.energy_axis, dtype=float),
+                    np.asarray(entry.spectrum, dtype=float),
+                ]
+            )
+            np.savetxt(state_dir / f"saved_map_{index}.xy", spectrum_xy, header="x y", comments="")
+        (state_dir / "reproduce_state.py").write_text(self._build_state_repro_script())
+
+    def _save_session_state(self):
+        state_dir = self._next_saved_state_dir()
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        metadata = self._current_state_metadata()
+        saved_map_metadata, saved_map_arrays = self._serialize_saved_map_entries()
+        metadata["saved_map_entries"] = saved_map_metadata
+
+        self._state_metadata_path(state_dir).write_text(json.dumps(metadata, indent=2))
+        np.savez(self._state_arrays_path(state_dir), **saved_map_arrays)
+        self._write_saved_state_xy_files(state_dir)
+        self._refresh_saved_state_records()
+
+        for row, record in enumerate(self.saved_state_records):
+            if record.directory == state_dir:
+                self.saved_state_table.selectRow(row)
+                break
+        self._log(f"Saved session state to {state_dir}")
+
+    def _load_eels_from_path(self, path: str) -> object:
+        signal = load_signal(path)
+        image_signal = self.loaded.image_signal if self.loaded else None
+        image_path = self.loaded.image_path if self.loaded else None
+        self.loaded = LoadedData(signal, image_signal, path, image_path)
+        self._image_view_limits = None
+        self._corrected_view_limits = None
+        self.map_polygon_vertices = None
+        self.eels_path_label.setText(path)
+        self.shape_label.setText(str(signal.data.shape))
+        self._set_mode_from_signal(signal)
+        self._sync_ranges_to_loaded_data()
+        self._update_mode_specific_ui()
+        if self._current_mode_index() == 0:
+            self._reset_map_histogram_controls()
+        self._remember_data_dir(path)
+        if image_signal is None:
+            self._update_reference_image_preview()
+        self._refresh_saved_state_records()
+        return signal
+
+    def _load_image_from_path(self, path: str):
+        image_signal = load_signal(path)
+        if self.loaded is None:
+            self.loaded = LoadedData(image_signal, image_signal, "", path)
+        else:
+            self.loaded.image_signal = image_signal
+            self.loaded.image_path = path
+        self.image_path_label.setText(path)
+        self._remember_data_dir(path)
+        self._reset_reference_image_controls()
+
+    def _load_selected_session_state(self):
+        selected_rows = self.saved_state_table.selectionModel().selectedRows()
+        if not selected_rows:
+            QtWidgets.QMessageBox.information(self, "Select saved state", "Select a saved state to load.")
+            return
+        row = selected_rows[0].row()
+        if row < 0 or row >= len(self.saved_state_records):
+            return
+        record = self.saved_state_records[row]
+        metadata_path = self._state_metadata_path(record.directory)
+        arrays_path = self._state_arrays_path(record.directory)
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            arrays = np.load(arrays_path, allow_pickle=False)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Failed to load state", f"Could not load saved state:\n\n{exc}")
+            return
+
+        try:
+            eels_path = str(metadata.get("eels_path", ""))
+            image_path = str(metadata.get("image_path", ""))
+            if eels_path:
+                self._load_eels_from_path(eels_path)
+            if image_path and Path(image_path).exists():
+                self._load_image_from_path(image_path)
+
+            self._update_mode_specific_ui()
+
+            energy_range = metadata.get("energy_range", [self.energy_start_spin.value(), self.energy_stop_spin.value()])
+            self.energy_start_spin.setValue(int(energy_range[0]))
+            self.energy_stop_spin.setValue(int(energy_range[1]))
+
+            snapshot_vertical = metadata.get("snapshot_vertical_range", [self.stack_y0.value(), self.stack_y1.value()])
+            self.stack_y0.setValue(int(snapshot_vertical[0]))
+            self.stack_y1.setValue(int(snapshot_vertical[1]))
+
+            snapshot_frames = metadata.get("snapshot_frame_range", [self.frame_start.value(), self.frame_stop.value()])
+            self.frame_start.setValue(int(snapshot_frames[0]))
+            self.frame_stop.setValue(int(snapshot_frames[1]))
+            self.snapshot_index_spin.setValue(int(metadata.get("snapshot_index", self.snapshot_index_spin.value())))
+
+            fit_window = metadata.get("fit_window", [self.fit_start_spin.value(), self.fit_stop_spin.value()])
+            self.fit_start_spin.setValue(float(fit_window[0]))
+            self.fit_stop_spin.setValue(float(fit_window[1]))
+            guess_window = metadata.get("guess_window", [self.guess_start_spin.value(), self.guess_stop_spin.value()])
+            self.guess_start_spin.setValue(float(guess_window[0]))
+            self.guess_stop_spin.setValue(float(guess_window[1]))
+
+            polygon_vertices = metadata.get("map_polygon_vertices", [])
+            self.map_polygon_vertices = [(float(x), float(y)) for x, y in polygon_vertices] if polygon_vertices else None
+
+            slider_values = metadata.get("map_mask_slider", [self.map_mask_min_slider.value(), self.map_mask_max_slider.value()])
+            self._draw_initial_image()
+            self.map_mask_min_slider.setValue(int(slider_values[0]))
+            self.map_mask_max_slider.setValue(int(slider_values[1]))
+
+            self.normalize_saved_spectra_checkbox.setChecked(bool(metadata.get("normalize_saved_spectra", False)))
+            self.saved_map_entries = self._deserialize_saved_map_entries(
+                list(metadata.get("saved_map_entries", [])),
+                arrays,
+            )
+            self._refresh_saved_map_table()
+            if self.loaded is not None and self.loaded.eels_path:
+                self._process_current()
+            else:
+                self._update_view_for_active_tab()
+            self._log(f"Loaded session state from {record.directory}")
+        finally:
+            arrays.close()
 
     def _refresh_saved_map_table(self):
         self._updating_saved_map_table = True
@@ -480,33 +1073,87 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             entry.comment = item.text()
         self._update_view_for_active_tab()
 
-    def _add_current_map_entry(self):
-        if not isinstance(self.current_result, MapProcessingResult):
+    def _remove_selected_saved_entries(self):
+        selected_rows = sorted(
+            {index.row() for index in self.saved_map_table.selectionModel().selectedRows()},
+            reverse=True,
+        )
+        if not selected_rows:
+            QtWidgets.QMessageBox.information(self, "Select saved entry", "Select one or more saved entries to remove.")
+            return
+        for row in selected_rows:
+            if 0 <= row < len(self.saved_map_entries):
+                del self.saved_map_entries[row]
+        self._refresh_saved_map_table()
+        self._update_view_for_active_tab()
+
+    def _add_current_entry(self):
+        if self.current_result is None:
             QtWidgets.QMessageBox.information(
                 self,
-                "Map result required",
-                "Run a 2D map analysis before adding the current spectrum to Saved Maps.",
+                "No processed result",
+                "Run processing before adding the current spectrum to Saved.",
             )
             return
-        entry = SavedMapEntry(
-            show=True,
-            locked=False,
-            comment=f"Map {len(self.saved_map_entries) + 1}",
-            roi_text=self._current_map_roi_text(),
-            polygon_vertices=list(self.map_polygon_vertices or []),
-            selection_mask=np.asarray(self.current_result.selection_mask, dtype=bool).copy(),
-            display_image=np.asarray(self.current_result.display_image, dtype=float).copy(),
-            masked_image=np.asarray(self.current_result.masked_image, dtype=float).copy(),
-            intensity_range=self._map_intensity_range_values(),
-            energy_axis_raw=np.asarray(self.current_result.energy_axis_raw, dtype=float).copy(),
-            fit_window=self._fit_window(),
-            selected_spectra=np.asarray(self.current_result.selected_spectra, dtype=float).copy(),
-            energy_axis=np.asarray(self.current_result.energy_axis_calibrated, dtype=float).copy(),
-            spectrum=np.asarray(self.current_result.summed_spectrum, dtype=float).copy(),
-        )
+        if isinstance(self.current_result, MapProcessingResult):
+            entry = SavedMapEntry(
+                mode="map",
+                show=True,
+                locked=False,
+                comment=f"Map {len(self.saved_map_entries) + 1}",
+                roi_text=self._current_map_roi_text(),
+                polygon_vertices=list(self.map_polygon_vertices or []),
+                selection_mask=np.asarray(self.current_result.selection_mask, dtype=bool).copy(),
+                display_image=np.asarray(self.current_result.display_image, dtype=float).copy(),
+                masked_image=np.asarray(self.current_result.masked_image, dtype=float).copy(),
+                intensity_range=self._map_intensity_range_values(),
+                energy_axis_raw=np.asarray(self.current_result.energy_axis_raw, dtype=float).copy(),
+                fit_window=self._fit_window(),
+                selected_spectra=np.asarray(self.current_result.selected_spectra, dtype=float).copy(),
+                energy_axis=np.asarray(self.current_result.energy_axis_calibrated, dtype=float).copy(),
+                spectrum=np.asarray(self.current_result.summed_spectrum, dtype=float).copy(),
+            )
+        elif isinstance(self.current_result, StackProcessingResult):
+            frame_index = min(self.snapshot_index_spin.value(), self.loaded.eels_signal.data.shape[0] - 1)
+            detector_image = np.asarray(self.loaded.eels_signal.data[frame_index], dtype=float)
+            y0 = self.stack_y0.value()
+            y1 = self.stack_y1.value()
+            aligned_image = self._current_snapshot_aligned_image()
+            if aligned_image is None:
+                aligned_image = np.zeros((max(1, y1 - y0), detector_image.shape[1]), dtype=float)
+            masked_image = np.full(detector_image.shape, np.nan, dtype=float)
+            row_stop = min(y0 + aligned_image.shape[0], masked_image.shape[0])
+            col_stop = min(aligned_image.shape[1], masked_image.shape[1])
+            if row_stop > y0 and col_stop > 0:
+                masked_image[y0:row_stop, :col_stop] = aligned_image[: row_stop - y0, :col_stop]
+            entry = SavedMapEntry(
+                mode="spot",
+                show=True,
+                locked=False,
+                comment=f"Spot {len(self.saved_map_entries) + 1}",
+                roi_text=self._current_spot_roi_text(),
+                polygon_vertices=self._current_spot_roi_polygon(detector_image.shape[1]),
+                selection_mask=np.zeros(detector_image.shape, dtype=bool),
+                display_image=detector_image.copy(),
+                masked_image=masked_image,
+                intensity_range=(0.0, 0.0),
+                energy_axis_raw=np.asarray(self.current_result.energy_axis_raw, dtype=float).copy(),
+                fit_window=self._fit_window(),
+                selected_spectra=np.asarray(aligned_image, dtype=float).copy(),
+                energy_axis=np.asarray(self.current_result.energy_axis_calibrated, dtype=float).copy(),
+                spectrum=np.asarray(self.current_result.summed_spectrum, dtype=float).copy(),
+            )
+            entry.selection_mask[y0:y1, :] = True
+        else:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Unsupported result",
+                "The current result cannot be added to Saved.",
+            )
+            return
         self.saved_map_entries.append(entry)
         self._refresh_saved_map_table()
-        self._log(f"Added saved map spectrum #{len(self.saved_map_entries)}.")
+        self._log(f"Added saved spectrum #{len(self.saved_map_entries)}.")
         self._draw_initial_image()
 
     def _update_saved_spectra_plot(self):
@@ -515,7 +1162,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
         visible_entries = self._saved_map_entries_for_display()
         if not visible_entries:
-            spectrum_ax.text(0.5, 0.5, "No saved map spectra selected for display", ha="center", va="center")
+            spectrum_ax.text(0.5, 0.5, "No saved spectra selected for display", ha="center", va="center")
             spectrum_ax.set_axis_off()
             self.spectrum_canvas.draw_idle()
             return
@@ -537,7 +1184,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
         spectrum_ax.set_xlabel("Energy loss (eV, ZLP corrected)")
         spectrum_ax.set_ylabel("Normalized intensity" if normalize else "Intensity (a.u.)")
-        spectrum_ax.set_title("Saved map spectra")
+        spectrum_ax.set_title(self._current_filename_label())
         spectrum_ax_top = spectrum_ax.secondary_xaxis(
             "top",
             functions=(lambda x: x * EV_TO_CMINV, lambda x: x / EV_TO_CMINV),
@@ -549,7 +1196,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
     def _clear_saved_maps_preview(self):
         self.image_canvas.figure.clear()
         image_ax = self.image_canvas.figure.add_subplot(111)
-        image_ax.text(0.5, 0.5, "No saved maps selected for display", ha="center", va="center")
+        image_ax.text(0.5, 0.5, "No saved entries selected for display", ha="center", va="center")
         image_ax.set_axis_off()
         self.image_canvas.draw_idle()
 
@@ -567,7 +1214,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
         self.spectrum_canvas.figure.clear()
         spectrum_ax = self.spectrum_canvas.figure.add_subplot(111)
-        spectrum_ax.text(0.5, 0.5, "No saved map spectra selected for display", ha="center", va="center")
+        spectrum_ax.text(0.5, 0.5, "No saved spectra selected for display", ha="center", va="center")
         spectrum_ax.set_axis_off()
         self.spectrum_canvas.draw_idle()
 
@@ -576,16 +1223,18 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         if not entries:
             self._clear_saved_maps_preview()
             return
+        preview_mode = entries[0][1].mode
+        preview_entries = [(row, entry) for row, entry in entries if entry.mode == preview_mode]
 
         self._detach_selector()
         self.image_canvas.figure.clear()
         image_ax = self.image_canvas.figure.add_subplot(111)
-        base_image = np.asarray(entries[0][1].display_image, dtype=float)
-        image_ax.imshow(base_image, cmap="inferno", origin="upper")
-        image_ax.set_title("Saved map ROI overlays")
+        base_image = np.asarray(preview_entries[0][1].display_image, dtype=float)
+        image_ax.imshow(base_image, cmap="inferno" if preview_mode == "map" else "viridis", origin="upper", aspect="auto")
+        image_ax.set_title("ROI")
         image_ax.set_xlabel("")
         image_ax.set_ylabel("")
-        for row, entry in entries:
+        for row, entry in preview_entries:
             color = self._saved_map_entry_color(row)
             if entry.polygon_vertices:
                 image_ax.add_patch(
@@ -601,24 +1250,37 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
         self.corrected_canvas.figure.clear()
         corrected_ax = self.corrected_canvas.figure.add_subplot(111)
-        combined_masked = np.full_like(entries[0][1].masked_image, np.nan, dtype=float)
-        for _, entry in entries:
-            combined_masked = np.where(np.isfinite(entry.masked_image), entry.masked_image, combined_masked)
+        base_masked = self._saved_entry_masked_image_for_display(preview_entries[0][1])
+        combined_masked = np.full_like(base_masked, np.nan, dtype=float)
+        for _, entry in preview_entries:
+            entry_masked = self._saved_entry_masked_image_for_display(entry)
+            if entry_masked.shape != combined_masked.shape:
+                continue
+            combined_masked = np.where(np.isfinite(entry_masked), entry_masked, combined_masked)
         masked = np.ma.masked_invalid(combined_masked)
-        corrected_ax.imshow(masked, cmap="inferno", origin="upper")
-        corrected_ax.set_title("Masked map intensities")
+        corrected_ax.imshow(masked, cmap="inferno" if preview_mode == "map" else "viridis", origin="upper", aspect="auto")
+        corrected_ax.set_title("Masked ROI")
         corrected_ax.set_xlabel("")
         corrected_ax.set_ylabel("")
         self.corrected_canvas.draw_idle()
 
         self.fit_canvas.figure.clear()
         fit_ax = self.fit_canvas.figure.add_subplot(111)
-        for row, entry in entries:
+        active_entry = preview_entries[0][1]
+        active_fit_mask = (
+            (active_entry.energy_axis_raw >= active_entry.fit_window[0])
+            & (active_entry.energy_axis_raw <= active_entry.fit_window[1])
+        )
+        spectra_label = "Intensity"
+        for row, entry in preview_entries:
             fit_mask = (
                 (entry.energy_axis_raw >= entry.fit_window[0])
                 & (entry.energy_axis_raw <= entry.fit_window[1])
             )
-            for index, spectrum in enumerate(entry.selected_spectra[:, fit_mask]):
+            spectra_stack = np.asarray(entry.selected_spectra, dtype=float)
+            if spectra_stack.ndim == 1:
+                spectra_stack = spectra_stack[np.newaxis, :]
+            for index, spectrum in enumerate(spectra_stack[:, fit_mask]):
                 fit_ax.plot(
                     entry.energy_axis_raw[fit_mask],
                     spectrum,
@@ -632,11 +1294,13 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             color="royalblue",
             linewidth=1.0,
             linestyle=":",
-            label="alignment target",
+            label="alignment target" if len(preview_entries) == 1 else "_nolegend_",
         )
-        fit_ax.set_title("ZLP alignment comparison")
+        fit_ax.set_title(
+            f"ZLP (FWHM = {self._curve_fwhm(active_entry.energy_axis_raw[active_fit_mask], active_entry.spectrum[active_fit_mask]):.2e} eV)"
+        )
         fit_ax.set_xlabel("Energy loss (eV)")
-        fit_ax.set_ylabel("ZLP region")
+        fit_ax.set_ylabel(spectra_label)
         fit_ax.legend(loc="best", fontsize=8)
         self.fit_canvas.draw_idle()
 
@@ -677,26 +1341,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            signal = load_signal(path)
+            self._load_eels_from_path(path)
         except Exception as exc:
             self._log(f"Failed to load EELS file: {exc}")
             return
-
-        image_signal = self.loaded.image_signal if self.loaded else None
-        image_path = self.loaded.image_path if self.loaded else None
-        self.loaded = LoadedData(signal, image_signal, path, image_path)
-        self._image_view_limits = None
-        self._corrected_view_limits = None
-        self.map_polygon_vertices = None
-        self.eels_path_label.setText(path)
-        self.shape_label.setText(str(signal.data.shape))
-        self._set_mode_from_signal(signal)
-        self._sync_ranges_to_loaded_data()
-        self._update_mode_specific_ui()
-        if self.mode_combo.currentIndex() == 0:
-            self._reset_map_histogram_controls()
         self._draw_initial_image()
-        self._remember_data_dir(path)
         self._log(f"Loaded EELS signal: {path}")
 
     def _load_image(self):
@@ -709,19 +1358,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            image_signal = load_signal(path)
+            self._load_image_from_path(path)
         except Exception as exc:
             self._log(f"Failed to load image file: {exc}")
             return
-
-        if self.loaded is None:
-            self.loaded = LoadedData(image_signal, image_signal, "", path)
-        else:
-            self.loaded.image_signal = image_signal
-            self.loaded.image_path = path
-        self.image_path_label.setText(path)
         self._draw_initial_image()
-        self._remember_data_dir(path)
         self._log(f"Loaded reference image: {path}")
 
     def _sync_ranges_to_loaded_data(self):
@@ -734,7 +1375,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.energy_stop_spin.setMaximum(shape[-1])
         self.energy_stop_spin.setValue(min(self.energy_stop_spin.value(), shape[-1]))
 
-        if self.mode_combo.currentIndex() == 0:
+        if self._current_mode_index() == 0:
             self.roi_x0.setMaximum(shape[1] - 1)
             self.roi_x1.setMaximum(shape[1])
             self.roi_y0.setMaximum(shape[0] - 1)
@@ -767,20 +1408,28 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             f"Unsupported HyperSpy signal type '{class_name}'. Expected Signal1D for map data or Signal2D for snapshot data."
         )
 
+    def _current_mode_index(self) -> int:
+        if self.loaded is None:
+            return 0
+        return self._detect_mode_index(self.loaded.eels_signal)
+
     def _set_mode_from_signal(self, signal):
         mode_index = self._detect_mode_index(signal)
-        self.mode_combo.blockSignals(True)
-        self.mode_combo.setCurrentIndex(mode_index)
-        self.mode_combo.blockSignals(False)
         mode_label = "map workflow (Signal1D)" if mode_index == 0 else "snapshot workflow (Signal2D)"
         self._log(f"Detected {mode_label}.")
 
     def _update_mode_specific_ui(self):
-        is_map_mode = self.mode_combo.currentIndex() == 0
+        is_map_mode = self._current_mode_index() == 0
         for widget in self.map_mode_widgets:
             widget.setEnabled(is_map_mode)
         for widget in self.snapshot_mode_widgets:
             widget.setEnabled(not is_map_mode)
+        self.tabs.setTabEnabled(self.map_tab_index, is_map_mode)
+        self.tabs.setTabEnabled(self.spot_tab_index, not is_map_mode)
+        if is_map_mode and self.tabs.currentIndex() == self.spot_tab_index:
+            self.tabs.setCurrentIndex(self.map_tab_index)
+        if not is_map_mode and self.tabs.currentIndex() == self.map_tab_index:
+            self.tabs.setCurrentIndex(self.spot_tab_index)
         if is_map_mode:
             self.snapshot_index_spin.setEnabled(False)
             self.snapshot_prev_button.setEnabled(False)
@@ -789,7 +1438,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self._update_snapshot_navigation_enabled()
 
     def _map_intensity_image(self) -> Optional[np.ndarray]:
-        if self.loaded is None or self.mode_combo.currentIndex() != 0:
+        if self.loaded is None or self._current_mode_index() != 0:
             return None
         data = np.asarray(self.loaded.eels_signal.data)
         if data.ndim != 3:
@@ -882,11 +1531,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
     def _on_map_mask_slider_changed(self):
         self._update_map_histogram()
-        if self.mode_combo.currentIndex() == 0:
+        if self._current_mode_index() == 0:
             self._update_map_mask_preview()
 
     def _update_map_mask_preview(self):
-        if self.mode_combo.currentIndex() != 0:
+        if self._current_mode_index() != 0:
             return
         self.corrected_canvas.figure.clear()
         ax = self.corrected_canvas.figure.add_subplot(111)
@@ -922,7 +1571,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.selector = None
 
     def _draw_initial_image(self):
-        preserve_view = self.loaded is not None and self.mode_combo.currentIndex() == 1
+        preserve_view = self.loaded is not None and self._current_mode_index() == 1
         if preserve_view and self.image_canvas.figure.axes:
             current_ax = self.image_canvas.figure.axes[0]
             self._image_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
@@ -936,7 +1585,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.image_canvas.draw_idle()
             return
 
-        mode_index = self.mode_combo.currentIndex()
+        mode_index = self._current_mode_index()
         data = np.asarray(self.loaded.eels_signal.data)
         if mode_index == 0:
             image = self._map_intensity_image()
@@ -946,7 +1595,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             ax.set_ylabel("")
             divider = make_axes_locatable(ax)
             cax = divider.append_axes("right", size="4%", pad=0.08)
-            self.image_canvas.figure.colorbar(im, cax=cax)
+            colorbar = self.image_canvas.figure.colorbar(im, cax=cax)
+            self._format_colorbar_scientific(colorbar)
         else:
             frame_index = min(self.snapshot_index_spin.value(), data.shape[0] - 1)
             detector_image = data[frame_index]
@@ -956,16 +1606,18 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             ax.set_ylabel("")
             self._apply_saved_image_view(ax, detector_image.shape[1], detector_image.shape[0])
 
+        overlay_image = self._reference_image_for_map_overlay()
         if self.loaded.image_signal is not None and np.asarray(self.loaded.image_signal.data).ndim >= 2:
             if mode_index != 0:
                 self.image_canvas.draw_idle()
                 self._attach_selector()
                 self._update_selection_overlay()
                 return
-            try:
-                ax.imshow(np.asarray(self.loaded.image_signal.data), cmap="gray", alpha=0.25, origin="upper")
-            except Exception:
-                pass
+            if overlay_image is not None:
+                try:
+                    ax.imshow(overlay_image, cmap="gray", alpha=0.25, origin="upper")
+                except Exception:
+                    pass
 
         self.image_canvas.draw_idle()
         self._attach_selector()
@@ -977,7 +1629,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         axes = self.image_canvas.figure.axes
         if not axes:
             return
-        if self.mode_combo.currentIndex() == 0:
+        if self._current_mode_index() == 0:
             self.selector = PolygonSelector(
                 axes[0],
                 self._on_polygon_selected,
@@ -1000,7 +1652,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.selector.set_active(self.enable_selector.isChecked())
 
     def _on_polygon_selected(self, verts):
-        if self.mode_combo.currentIndex() != 0:
+        if self._current_mode_index() != 0:
             return
         self.map_polygon_vertices = [(float(x), float(y)) for x, y in verts]
         self._reset_map_histogram_controls(preserve_mask_range=True)
@@ -1010,7 +1662,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         if eclick.ydata is None or erelease.ydata is None:
             return
         y0, y1 = sorted([int(round(eclick.ydata)), int(round(erelease.ydata))])
-        if self.mode_combo.currentIndex() == 0:
+        if self._current_mode_index() == 0:
             if eclick.xdata is None or erelease.xdata is None:
                 return
             x0, x1 = sorted([int(round(eclick.xdata)), int(round(erelease.xdata))])
@@ -1050,7 +1702,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
                 self.selection_polygon.remove()
             except Exception:
                 pass
-        if self.mode_combo.currentIndex() == 0:
+        if self._current_mode_index() == 0:
             polygon_mask = self._current_polygon_mask()
             if self.map_polygon_vertices is None and polygon_mask is not None:
                 height, width = polygon_mask.shape
@@ -1079,7 +1731,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.selection_rect = Rectangle((x0, y0), width, height, fill=False, edgecolor="cyan", linewidth=1.5)
         ax.add_patch(self.selection_rect)
         if (
-            self.mode_combo.currentIndex() == 1
+            self._current_mode_index() == 1
             and self.loaded is not None
             and self._image_view_limits is None
         ):
@@ -1087,21 +1739,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             ax.set_ylim(self.loaded.eels_signal.data.shape[1] - 1, 0)
         self.image_canvas.draw_idle()
 
-    def _on_mode_changed(self):
-        if self.loaded is not None:
-            try:
-                detected = self._detect_mode_index(self.loaded.eels_signal)
-            except ValueError:
-                detected = self.mode_combo.currentIndex()
-            if detected != self.mode_combo.currentIndex():
-                self.mode_combo.blockSignals(True)
-                self.mode_combo.setCurrentIndex(detected)
-                self.mode_combo.blockSignals(False)
-        self._update_mode_specific_ui()
-        self._draw_initial_image()
-
     def _update_snapshot_navigation_enabled(self):
-        enabled = self.loaded is not None and self.mode_combo.currentIndex() == 1
+        enabled = self.loaded is not None and self._current_mode_index() == 1
         self.snapshot_index_spin.setEnabled(enabled)
         self.snapshot_prev_button.setEnabled(enabled)
         self.snapshot_next_button.setEnabled(enabled)
@@ -1213,7 +1852,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         return arrays
 
     def _collect_export_parameters(self) -> dict[str, object]:
-        mode = "snapshot" if self.mode_combo.currentIndex() == 1 else "map"
+        mode = "snapshot" if self._current_mode_index() == 1 else "map"
         params: dict[str, object] = {
             "saved_at": datetime.now().isoformat(),
             "mode": mode,
@@ -1382,13 +2021,13 @@ plt.show()
         ax.set_ylim(y0, y1)
 
     def _on_snapshot_index_changed(self):
-        if self.mode_combo.currentIndex() == 1 and isinstance(self.current_result, StackProcessingResult):
+        if self._current_mode_index() == 1 and isinstance(self.current_result, StackProcessingResult):
             self._render_result(self.current_result)
             return
         self._draw_initial_image()
 
     def _current_snapshot_spectrum(self) -> Optional[np.ndarray]:
-        if self.loaded is None or self.mode_combo.currentIndex() != 1:
+        if self.loaded is None or self._current_mode_index() != 1:
             return None
         data = np.asarray(self.loaded.eels_signal.data)
         if data.ndim != 3:
@@ -1400,7 +2039,7 @@ plt.show()
         return aligned_rows.sum(axis=0)
 
     def _current_snapshot_aligned_image(self) -> Optional[np.ndarray]:
-        if self.loaded is None or self.mode_combo.currentIndex() != 1:
+        if self.loaded is None or self._current_mode_index() != 1:
             return None
         data = np.asarray(self.loaded.eels_signal.data)
         if data.ndim != 3:
@@ -1421,7 +2060,7 @@ plt.show()
             self._log("Load an EELS dataset before processing.")
             return
         try:
-            if self.mode_combo.currentIndex() == 0:
+            if self._current_mode_index() == 0:
                 polygon_mask = self._current_polygon_mask()
                 if polygon_mask is None:
                     raise ValueError("Map polygon ROI is not available.")
@@ -1451,14 +2090,7 @@ plt.show()
         self._log("Processing complete.")
 
     def _current_display_image(self):
-        if self.loaded is None or self.loaded.image_signal is None:
-            return None
-        data = np.asarray(self.loaded.image_signal.data)
-        if data.ndim == 2:
-            return data
-        if data.ndim > 2:
-            return np.squeeze(data)
-        return None
+        return self._reference_image_for_map_overlay()
 
     def _render_result(self, result):
         if isinstance(result, StackProcessingResult) and self.image_canvas.figure.axes:
@@ -1472,8 +2104,9 @@ plt.show()
             im = image_ax.imshow(result.intensity_image, cmap="inferno", origin="upper")
             divider = make_axes_locatable(image_ax)
             cax = divider.append_axes("right", size="4%", pad=0.08)
-            self.image_canvas.figure.colorbar(im, cax=cax)
-            image_ax.set_title("Map intensity preview")
+            colorbar = self.image_canvas.figure.colorbar(im, cax=cax)
+            self._format_colorbar_scientific(colorbar)
+            image_ax.set_title("ROI")
             pixel_count_text = str(result.selected_pixel_count)
             cal_axis = result.energy_axis_calibrated
             image_ax.set_xlabel("")
@@ -1531,7 +2164,7 @@ plt.show()
         else:
             masked = np.ma.masked_invalid(result.masked_image)
             corrected_ax.imshow(masked, cmap="inferno", origin="upper")
-            corrected_ax.set_title("Masked image")
+            corrected_ax.set_title("Masked ROI")
             corrected_ax.set_xlabel("")
             corrected_ax.set_ylabel("")
         self.corrected_canvas.draw_idle()
@@ -1586,7 +2219,7 @@ plt.show()
                 color="royalblue",
                 linewidth=1.0,
                 linestyle=":",
-                label="per-spectrum alignment target",
+                label="_nolegend_",
             )
             fit_ax.plot(
                 result.zero_loss_fit.fit_x,
@@ -1610,11 +2243,11 @@ plt.show()
                 label=f"residual centroid = {result.zero_loss_fit.center_ev:.5f} eV",
             )
         fit_ax.set_xlabel("Energy loss (eV)")
-        fit_ax.set_ylabel("ZLP region")
+        fit_ax.set_ylabel("Intensity")
         fit_ax.set_title(
             "ZLP, aligned"
             if isinstance(result, StackProcessingResult)
-            else "ZLP, per-spectrum aligned then summed"
+            else f"ZLP (FWHM = {self._curve_fwhm(result.zero_loss_fit.fit_x, result.zero_loss_fit.best_fit):.2e} eV)"
         )
         fit_ax.legend(loc="lower left", fontsize=8)
 
@@ -1625,6 +2258,7 @@ plt.show()
         spectrum_ax.plot(cal_axis, result.summed_spectrum, color="black", linewidth=1.0)
         spectrum_ax.set_xlabel("Energy loss (eV, ZLP corrected)")
         spectrum_ax.set_ylabel("Intensity (a.u.)")
+        spectrum_ax.set_title(self._current_filename_label())
         spectrum_ax_top = spectrum_ax.secondary_xaxis(
             "top",
             functions=(lambda x: x * EV_TO_CMINV, lambda x: x / EV_TO_CMINV),
