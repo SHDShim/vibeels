@@ -1,6 +1,6 @@
 # vibeels
 
-`vibeels` is a PyQt application for vibrational EELS spectrum extraction and zero-loss peak calibration using HyperSpy.
+`vibeels` is a PyQt6 application for vibrational EELS spectrum extraction and zero-loss peak calibration using HyperSpy.
 
 ## Features
 

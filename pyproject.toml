@@ -27,7 +27,7 @@ dependencies = [
   "matplotlib",
   "lmfit",
   "hyperspy",
-  "PyQt5",
+  "PyQt6",
 ]
 
 [project.urls]

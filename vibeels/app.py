@@ -14,18 +14,18 @@ if not os.environ.get("MPLCONFIGDIR"):
 
 import matplotlib
 
-matplotlib.use("Qt5Agg")
+matplotlib.use("QtAgg")
 
 import numpy as np
 from matplotlib import ticker
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from matplotlib.patches import Polygon, Rectangle
 from matplotlib.path import Path as MplPath
 from matplotlib.widgets import PolygonSelector, RectangleSelector
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from .processing import (
     EV_TO_CMINV,
@@ -37,6 +37,15 @@ from .processing import (
     process_snapshot_stack,
 )
 from .version import __version__
+
+
+QtOrientation = QtCore.Qt.Orientation
+QtItemFlag = QtCore.Qt.ItemFlag
+QtCheckState = QtCore.Qt.CheckState
+HeaderResizeMode = QtWidgets.QHeaderView.ResizeMode
+SelectionBehavior = QtWidgets.QAbstractItemView.SelectionBehavior
+SelectionMode = QtWidgets.QAbstractItemView.SelectionMode
+MessageBoxButton = QtWidgets.QMessageBox.StandardButton
 
 
 @dataclass
@@ -122,7 +131,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         outer = QtWidgets.QHBoxLayout(central)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter = QtWidgets.QSplitter(QtOrientation.Horizontal)
         outer.addWidget(splitter)
 
         left_panel = QtWidgets.QWidget()
@@ -215,12 +224,12 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.saved_state_table = QtWidgets.QTableWidget(0, 3)
         self.saved_state_table.setHorizontalHeaderLabels(["Folder", "Timestamp", "Comment"])
         state_header = self.saved_state_table.horizontalHeader()
-        state_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        state_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-        state_header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+        state_header.setSectionResizeMode(0, HeaderResizeMode.ResizeToContents)
+        state_header.setSectionResizeMode(1, HeaderResizeMode.ResizeToContents)
+        state_header.setSectionResizeMode(2, HeaderResizeMode.Stretch)
         self.saved_state_table.verticalHeader().setVisible(False)
-        self.saved_state_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.saved_state_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.saved_state_table.setSelectionBehavior(SelectionBehavior.SelectRows)
+        self.saved_state_table.setSelectionMode(SelectionMode.SingleSelection)
         self.saved_state_table.setAlternatingRowColors(True)
         self.saved_state_table.itemChanged.connect(self._on_saved_state_item_changed)
         self.saved_state_table.setMinimumHeight(180)
@@ -238,8 +247,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.image_path_label = QtWidgets.QLabel("Optional image not loaded")
         self.image_path_label.setWordWrap(True)
 
-        self.reference_image_min_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.reference_image_max_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.reference_image_min_slider = QtWidgets.QSlider(QtOrientation.Horizontal)
+        self.reference_image_max_slider = QtWidgets.QSlider(QtOrientation.Horizontal)
         for slider in [self.reference_image_min_slider, self.reference_image_max_slider]:
             slider.setRange(0, 1000)
             slider.valueChanged.connect(self._update_reference_image_preview)
@@ -286,8 +295,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.enable_selector.setChecked(True)
         self.enable_selector.toggled.connect(self._sync_selector_state)
 
-        self.map_mask_min_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.map_mask_max_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.map_mask_min_slider = QtWidgets.QSlider(QtOrientation.Horizontal)
+        self.map_mask_max_slider = QtWidgets.QSlider(QtOrientation.Horizontal)
         for slider in [self.map_mask_min_slider, self.map_mask_max_slider]:
             slider.setRange(0, 1000)
             slider.valueChanged.connect(self._on_map_mask_slider_changed)
@@ -438,13 +447,13 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.saved_map_table = QtWidgets.QTableWidget(0, 4)
         self.saved_map_table.setHorizontalHeaderLabels(["👁", "🔒", "Comment", "ROI coordinates"])
         header = self.saved_map_table.horizontalHeader()
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(0, HeaderResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, HeaderResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, HeaderResizeMode.Stretch)
+        header.setSectionResizeMode(3, HeaderResizeMode.Stretch)
         self.saved_map_table.verticalHeader().setVisible(False)
-        self.saved_map_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.saved_map_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.saved_map_table.setSelectionBehavior(SelectionBehavior.SelectRows)
+        self.saved_map_table.setSelectionMode(SelectionMode.ExtendedSelection)
         self.saved_map_table.setAlternatingRowColors(True)
         self.saved_map_table.itemChanged.connect(self._on_saved_map_item_changed)
         self._set_saved_map_header_icons()
@@ -471,8 +480,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
     def _make_checkbox_table_item(self, checked: bool) -> QtWidgets.QTableWidgetItem:
         item = QtWidgets.QTableWidgetItem()
-        item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsUserCheckable)
-        item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+        item.setFlags(QtItemFlag.ItemIsEnabled | QtItemFlag.ItemIsSelectable | QtItemFlag.ItemIsUserCheckable)
+        item.setCheckState(QtCheckState.Checked if checked else QtCheckState.Unchecked)
         return item
 
     def _current_map_roi_text(self) -> str:
@@ -662,16 +671,16 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.saved_state_table.setRowCount(len(self.saved_state_records))
             for row, record in enumerate(self.saved_state_records):
                 folder_item = QtWidgets.QTableWidgetItem(record.folder_name)
-                folder_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                folder_item.setFlags(QtItemFlag.ItemIsEnabled | QtItemFlag.ItemIsSelectable)
                 self.saved_state_table.setItem(row, 0, folder_item)
 
                 timestamp_item = QtWidgets.QTableWidgetItem(record.saved_at)
-                timestamp_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                timestamp_item.setFlags(QtItemFlag.ItemIsEnabled | QtItemFlag.ItemIsSelectable)
                 self.saved_state_table.setItem(row, 1, timestamp_item)
 
                 comment_item = QtWidgets.QTableWidgetItem(record.comment)
                 comment_item.setFlags(
-                    QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEditable
+                    QtItemFlag.ItemIsEnabled | QtItemFlag.ItemIsSelectable | QtItemFlag.ItemIsEditable
                 )
                 self.saved_state_table.setItem(row, 2, comment_item)
             self.saved_state_table.resizeRowsToContents()
@@ -1049,14 +1058,14 @@ plt.show()
                 self.saved_map_table.setItem(row, 1, self._make_checkbox_table_item(entry.locked))
 
                 comment_item = QtWidgets.QTableWidgetItem(entry.comment)
-                comment_flags = QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
+                comment_flags = QtItemFlag.ItemIsEnabled | QtItemFlag.ItemIsSelectable
                 if not entry.locked:
-                    comment_flags |= QtCore.Qt.ItemIsEditable
+                    comment_flags |= QtItemFlag.ItemIsEditable
                 comment_item.setFlags(comment_flags)
                 self.saved_map_table.setItem(row, 2, comment_item)
 
                 roi_item = QtWidgets.QTableWidgetItem(entry.roi_text)
-                roi_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                roi_item.setFlags(QtItemFlag.ItemIsEnabled | QtItemFlag.ItemIsSelectable)
                 self.saved_map_table.setItem(row, 3, roi_item)
             self.saved_map_table.resizeRowsToContents()
         finally:
@@ -1070,9 +1079,9 @@ plt.show()
             return
         entry = self.saved_map_entries[row]
         if item.column() == 0:
-            entry.show = item.checkState() == QtCore.Qt.Checked
+            entry.show = item.checkState() == QtCheckState.Checked
         elif item.column() == 1:
-            entry.locked = item.checkState() == QtCore.Qt.Checked
+            entry.locked = item.checkState() == QtCheckState.Checked
             self._refresh_saved_map_table()
         elif item.column() == 2:
             entry.comment = item.text()
@@ -1793,15 +1802,15 @@ plt.show()
                         f"The folder\n\n{target_dir}\n\nalready exists. "
                         "Saving may overwrite existing files."
                     ),
-                    QtWidgets.QMessageBox.Retry
-                    | QtWidgets.QMessageBox.Ok
-                    | QtWidgets.QMessageBox.Cancel,
-                    QtWidgets.QMessageBox.Retry,
+                    MessageBoxButton.Retry
+                    | MessageBoxButton.Ok
+                    | MessageBoxButton.Cancel,
+                    MessageBoxButton.Retry,
                 )
-                if reply == QtWidgets.QMessageBox.Retry:
+                if reply == MessageBoxButton.Retry:
                     suggested = target_dir
                     continue
-                if reply == QtWidgets.QMessageBox.Cancel:
+                if reply == MessageBoxButton.Cancel:
                     return None
             self._remember_data_dir(target_dir)
             return target_dir
@@ -2343,7 +2352,7 @@ def main():
     app.setStyle("Fusion")
     window = VibeelsWindow()
     window.show()
-    return app.exec_()
+    return app.exec()
 
 
 if __name__ == "__main__":
