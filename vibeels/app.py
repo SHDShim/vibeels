@@ -895,23 +895,28 @@ plt.show()
 '''
 
     def _write_saved_state_xy_files(self, state_dir: Path):
+        data_stem = Path(self.loaded.eels_path).stem if self.loaded is not None and self.loaded.eels_path else "current_spectrum"
+
         if self.current_result is not None:
+            energy_axis_ev = np.asarray(self.current_result.energy_axis_calibrated, dtype=float)
             current_xy = np.column_stack(
                 [
-                    np.asarray(self.current_result.energy_axis_calibrated, dtype=float),
+                    energy_axis_ev,
+                    energy_axis_ev * EV_TO_CMINV,
                     np.asarray(self.current_result.summed_spectrum, dtype=float),
                 ]
             )
-            np.savetxt(state_dir / "current_spectrum.xy", current_xy, header="x y", comments="")
+            np.savetxt(state_dir / f"{data_stem}.vxy", current_xy, header="eV cm-1 y", comments="")
 
         for index, entry in enumerate(self.saved_map_entries):
             spectrum_xy = np.column_stack(
                 [
                     np.asarray(entry.energy_axis, dtype=float),
+                    np.asarray(entry.energy_axis, dtype=float) * EV_TO_CMINV,
                     np.asarray(entry.spectrum, dtype=float),
                 ]
             )
-            np.savetxt(state_dir / f"saved_map_{index}.xy", spectrum_xy, header="x y", comments="")
+            np.savetxt(state_dir / f"{data_stem}_map_{index}.vxy", spectrum_xy, header="eV cm-1 y", comments="")
         (state_dir / "reproduce_state.py").write_text(self._build_state_repro_script())
 
     def _save_session_state(self):
