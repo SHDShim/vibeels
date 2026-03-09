@@ -36,6 +36,19 @@ from .processing import (
     process_map_dataset,
     process_snapshot_stack,
 )
+from .theme import (
+    PLOT_CYCLE,
+    PLOT_FIT,
+    PLOT_MAIN,
+    PLOT_PREVIEW,
+    PLOT_WARNING,
+    SPINE,
+    apply_qt_theme,
+    configure_matplotlib_defaults,
+    style_colorbar,
+    style_mpl_axes,
+    style_secondary_axis,
+)
 from .version import __version__
 
 
@@ -46,6 +59,8 @@ HeaderResizeMode = QtWidgets.QHeaderView.ResizeMode
 SelectionBehavior = QtWidgets.QAbstractItemView.SelectionBehavior
 SelectionMode = QtWidgets.QAbstractItemView.SelectionMode
 MessageBoxButton = QtWidgets.QMessageBox.StandardButton
+
+configure_matplotlib_defaults()
 
 
 @dataclass
@@ -93,6 +108,14 @@ class PlotCanvas(FigureCanvas):
         else:
             rows, cols = subplot_spec
             self.axes = [self.figure.add_subplot(rows, cols, index + 1) for index in range(rows * cols)]
+        style_mpl_axes(self.figure, *self.axes)
+
+    def reset_axis(self, subplot_spec=111):
+        self.figure.clear()
+        axis = self.figure.add_subplot(subplot_spec)
+        self.axes = [axis]
+        style_mpl_axes(self.figure, axis)
+        return axis
 
 
 class VibeelsWindow(QtWidgets.QMainWindow):
@@ -125,6 +148,20 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self._apply_default_ranges()
         self._update_reference_image_preview()
         self._refresh_saved_state_records()
+
+    def _make_button(
+        self,
+        text: str,
+        slot=None,
+    ) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        if slot is not None:
+            button.clicked.connect(slot)
+        return button
+
+    def _prepare_image_axis(self, axis):
+        axis.grid(False)
+        return axis
 
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -197,16 +234,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.eels_path_label = QtWidgets.QLabel("No EELS file loaded")
         self.eels_path_label.setWordWrap(True)
 
-        load_eels = QtWidgets.QPushButton("Load EELS DM3/DM4")
-        load_eels.clicked.connect(self._load_eels)
-        refresh = QtWidgets.QPushButton("Process Current Settings")
-        refresh.clicked.connect(self._process_current)
-        export_button = QtWidgets.QPushButton("Export NPY")
-        export_button.clicked.connect(self._save_results)
-        save_state = QtWidgets.QPushButton("Save status")
-        save_state.clicked.connect(self._save_session_state)
-        load_state = QtWidgets.QPushButton("Restore status")
-        load_state.clicked.connect(self._load_selected_session_state)
+        load_eels = self._make_button("Load EELS DM3/DM4", self._load_eels)
+        refresh = self._make_button("Process Current Settings", self._process_current)
+        export_button = self._make_button("Export NPY", self._save_results)
+        save_state = self._make_button("Save status", self._save_session_state)
+        load_state = self._make_button("Restore status", self._load_selected_session_state)
 
         self.shape_label = QtWidgets.QLabel("-")
 
@@ -242,8 +274,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(tab)
 
         controls = QtWidgets.QFormLayout()
-        load_image = QtWidgets.QPushButton("Load Reference Image")
-        load_image.clicked.connect(self._load_image)
+        load_image = self._make_button("Load Reference Image", self._load_image)
         self.image_path_label = QtWidgets.QLabel("Optional image not loaded")
         self.image_path_label.setWordWrap(True)
 
@@ -305,8 +336,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.map_hist_canvas = PlotCanvas((1, 1), self)
         self.map_hist_canvas.setMinimumHeight(180)
 
-        process_button = QtWidgets.QPushButton("Apply ROI / Alignment")
-        process_button.clicked.connect(self._process_current)
+        process_button = self._make_button("Apply ROI / Alignment", self._process_current)
 
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QFormLayout(tab)
@@ -350,10 +380,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.snapshot_index_spin = QtWidgets.QSpinBox()
         self.snapshot_index_spin.setMaximum(0)
         self.snapshot_index_spin.valueChanged.connect(self._on_snapshot_index_changed)
-        self.snapshot_prev_button = QtWidgets.QPushButton("Previous Snapshot")
-        self.snapshot_prev_button.clicked.connect(self._show_previous_snapshot)
-        self.snapshot_next_button = QtWidgets.QPushButton("Next Snapshot")
-        self.snapshot_next_button.clicked.connect(self._show_next_snapshot)
+        self.snapshot_prev_button = self._make_button("Previous Snapshot", self._show_previous_snapshot)
+        self.snapshot_next_button = self._make_button("Next Snapshot", self._show_next_snapshot)
         for widget in [self.stack_y0, self.stack_y1, self.frame_start, self.frame_stop]:
             widget.setMaximum(100000)
         self.stack_y0.valueChanged.connect(self._update_selection_overlay)
@@ -361,8 +389,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.frame_start.valueChanged.connect(self._draw_initial_image)
         self.frame_stop.valueChanged.connect(self._draw_initial_image)
 
-        process_button = QtWidgets.QPushButton("Apply ROI / Alignment")
-        process_button.clicked.connect(self._process_current)
+        process_button = self._make_button("Apply ROI / Alignment", self._process_current)
 
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QFormLayout(tab)
@@ -410,8 +437,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.zlp_center_label = QtWidgets.QLabel("-")
         self.pixel_count_label = QtWidgets.QLabel("-")
         self.axis_span_label = QtWidgets.QLabel("-")
-        process_button = QtWidgets.QPushButton("Run Zero-Loss Calibration")
-        process_button.clicked.connect(self._process_current)
+        process_button = self._make_button("Run Zero-Loss Calibration", self._process_current)
 
         layout.addRow("Fit start (eV)", self.fit_start_spin)
         layout.addRow("Fit stop (eV)", self.fit_stop_spin)
@@ -429,12 +455,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(tab)
 
         controls = QtWidgets.QHBoxLayout()
-        self.saved_update_plot_button = QtWidgets.QPushButton("Update plot")
-        self.saved_update_plot_button.clicked.connect(self._update_view_for_active_tab)
-        self.saved_add_current_button = QtWidgets.QPushButton("Add current")
-        self.saved_add_current_button.clicked.connect(self._add_current_entry)
-        self.saved_remove_selected_button = QtWidgets.QPushButton("Remove selected")
-        self.saved_remove_selected_button.clicked.connect(self._remove_selected_saved_entries)
+        self.saved_update_plot_button = self._make_button("Update plot", self._update_view_for_active_tab)
+        self.saved_add_current_button = self._make_button("Add current", self._add_current_entry)
+        self.saved_remove_selected_button = self._make_button("Remove selected", self._remove_selected_saved_entries)
         self.normalize_saved_spectra_checkbox = QtWidgets.QCheckBox("Normalize spectra intensity")
         self.normalize_saved_spectra_checkbox.toggled.connect(self._update_view_for_active_tab)
         controls.addWidget(self.saved_update_plot_button)
@@ -537,8 +560,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         ]
 
     def _saved_map_entry_color(self, row: int):
-        cmap = matplotlib.colormaps["tab10"]
-        return cmap(row % cmap.N)
+        return PLOT_CYCLE[row % len(PLOT_CYCLE)]
 
     def _saved_maps_tab_index(self) -> int:
         for index in range(self.tabs.count()):
@@ -617,8 +639,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         return z_min, z_max
 
     def _update_reference_image_preview(self):
-        self.reference_image_canvas.figure.clear()
-        ax = self.reference_image_canvas.figure.add_subplot(111)
+        ax = self.reference_image_canvas.reset_axis()
         image = self._current_reference_image_data()
         if image is None:
             ax.text(0.5, 0.5, "Load a reference image to preview it here", ha="center", va="center")
@@ -742,11 +763,16 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             return 0.0
         return float(x_values[mask][-1] - x_values[mask][0])
 
+    def _zlp_title(self, x_values: np.ndarray, y_values: np.ndarray, *, aligned: bool = False) -> str:
+        prefix = "ZLP, aligned" if aligned else "ZLP"
+        return f"{prefix} (FWHM = {self._curve_fwhm(x_values, y_values):.2e} eV)"
+
     def _format_colorbar_scientific(self, colorbar):
         formatter = ticker.ScalarFormatter(useMathText=True)
         formatter.set_powerlimits((0, 0))
         colorbar.formatter = formatter
         colorbar.update_ticks()
+        style_colorbar(colorbar)
 
     def _serialize_saved_map_entries(self) -> tuple[list[dict[str, object]], dict[str, np.ndarray]]:
         metadata_entries: list[dict[str, object]] = []
@@ -845,7 +871,24 @@ ax_zlp = fig.add_subplot(gs[0, 2])
 ax_spec = fig.add_subplot(gs[1, :])
 
 if shown:
+    def curve_fwhm(x_values, y_values):
+        x_values = np.asarray(x_values, dtype=float)
+        y_values = np.asarray(y_values, dtype=float)
+        if x_values.size < 2 or y_values.size < 2:
+            return 0.0
+        peak = float(np.max(y_values))
+        if peak <= 0:
+            return 0.0
+        half_max = peak / 2.0
+        mask = y_values >= half_max
+        if not np.any(mask):
+            return 0.0
+        return float(x_values[mask][-1] - x_values[mask][0])
+
     first_prefix = f"saved_map_{shown[0][0]}"
+    first_selected = np.asarray(arrays[f"{first_prefix}_selected_spectra"], dtype=float)
+    if first_selected.ndim == 1:
+        first_selected = first_selected[np.newaxis, :]
     base_image = np.asarray(arrays[f"{first_prefix}_display_image"], dtype=float)
     ax_roi.imshow(base_image, cmap="inferno", origin="upper")
     ax_roi.set_title("ROI")
@@ -880,8 +923,10 @@ if shown:
 
     ax_mask.imshow(np.ma.masked_invalid(combined_mask), cmap="inferno", origin="upper")
     ax_mask.set_title("Masked ROI")
-    ax_zlp.axvline(0.0, color="royalblue", linestyle=":", linewidth=1.0, label="alignment target")
-    ax_zlp.set_title("ZLP")
+    ax_zlp.axvline(0.0, color="#3b82f6", linestyle=":", linewidth=1.0, label="alignment target")
+    ax_zlp.set_title(
+        f"ZLP (FWHM = {curve_fwhm(arrays[f'{first_prefix}_energy_axis_raw'], np.sum(first_selected, axis=0)):.2e} eV)"
+    )
     ax_zlp.set_xlabel("Energy loss (eV)")
     ax_zlp.set_ylabel("ZLP region")
     ax_zlp.legend(loc="best", fontsize=8)
@@ -1171,8 +1216,7 @@ plt.show()
         self._draw_initial_image()
 
     def _update_saved_spectra_plot(self):
-        self.spectrum_canvas.figure.clear()
-        spectrum_ax = self.spectrum_canvas.figure.add_subplot(111)
+        spectrum_ax = self.spectrum_canvas.reset_axis()
 
         visible_entries = self._saved_map_entries_for_display()
         if not visible_entries:
@@ -1204,30 +1248,27 @@ plt.show()
             functions=(lambda x: x * EV_TO_CMINV, lambda x: x / EV_TO_CMINV),
         )
         spectrum_ax_top.set_xlabel(r"Wavenumber (cm$^{-1}$)")
+        style_secondary_axis(spectrum_ax_top)
         spectrum_ax.legend(loc="best", fontsize=8)
         self.spectrum_canvas.draw_idle()
 
     def _clear_saved_maps_preview(self):
-        self.image_canvas.figure.clear()
-        image_ax = self.image_canvas.figure.add_subplot(111)
+        image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
         image_ax.text(0.5, 0.5, "No saved entries selected for display", ha="center", va="center")
         image_ax.set_axis_off()
         self.image_canvas.draw_idle()
 
-        self.corrected_canvas.figure.clear()
-        corrected_ax = self.corrected_canvas.figure.add_subplot(111)
+        corrected_ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
         corrected_ax.text(0.5, 0.5, "No masked map preview", ha="center", va="center")
         corrected_ax.set_axis_off()
         self.corrected_canvas.draw_idle()
 
-        self.fit_canvas.figure.clear()
-        fit_ax = self.fit_canvas.figure.add_subplot(111)
+        fit_ax = self.fit_canvas.reset_axis()
         fit_ax.text(0.5, 0.5, "No ZLP alignment preview", ha="center", va="center")
         fit_ax.set_axis_off()
         self.fit_canvas.draw_idle()
 
-        self.spectrum_canvas.figure.clear()
-        spectrum_ax = self.spectrum_canvas.figure.add_subplot(111)
+        spectrum_ax = self.spectrum_canvas.reset_axis()
         spectrum_ax.text(0.5, 0.5, "No saved spectra selected for display", ha="center", va="center")
         spectrum_ax.set_axis_off()
         self.spectrum_canvas.draw_idle()
@@ -1241,8 +1282,7 @@ plt.show()
         preview_entries = [(row, entry) for row, entry in entries if entry.mode == preview_mode]
 
         self._detach_selector()
-        self.image_canvas.figure.clear()
-        image_ax = self.image_canvas.figure.add_subplot(111)
+        image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
         base_image = np.asarray(preview_entries[0][1].display_image, dtype=float)
         image_ax.imshow(base_image, cmap="inferno" if preview_mode == "map" else "viridis", origin="upper", aspect="auto")
         image_ax.set_title("ROI")
@@ -1262,8 +1302,7 @@ plt.show()
                 )
         self.image_canvas.draw_idle()
 
-        self.corrected_canvas.figure.clear()
-        corrected_ax = self.corrected_canvas.figure.add_subplot(111)
+        corrected_ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
         base_masked = self._saved_entry_masked_image_for_display(preview_entries[0][1])
         combined_masked = np.full_like(base_masked, np.nan, dtype=float)
         for _, entry in preview_entries:
@@ -1278,13 +1317,16 @@ plt.show()
         corrected_ax.set_ylabel("")
         self.corrected_canvas.draw_idle()
 
-        self.fit_canvas.figure.clear()
-        fit_ax = self.fit_canvas.figure.add_subplot(111)
+        fit_ax = self.fit_canvas.reset_axis()
         active_entry = preview_entries[0][1]
         active_fit_mask = (
             (active_entry.energy_axis_raw >= active_entry.fit_window[0])
             & (active_entry.energy_axis_raw <= active_entry.fit_window[1])
         )
+        active_spectra_stack = np.asarray(active_entry.selected_spectra, dtype=float)
+        if active_spectra_stack.ndim == 1:
+            active_spectra_stack = active_spectra_stack[np.newaxis, :]
+        active_zlp_profile = np.sum(active_spectra_stack[:, active_fit_mask], axis=0)
         spectra_label = "Intensity"
         for row, entry in preview_entries:
             fit_mask = (
@@ -1305,13 +1347,13 @@ plt.show()
                 )
         fit_ax.axvline(
             0.0,
-            color="royalblue",
+            color=PLOT_PREVIEW,
             linewidth=1.0,
             linestyle=":",
             label="alignment target" if len(preview_entries) == 1 else "_nolegend_",
         )
         fit_ax.set_title(
-            f"ZLP (FWHM = {self._curve_fwhm(active_entry.energy_axis_raw[active_fit_mask], active_entry.spectrum[active_fit_mask]):.2e} eV)"
+            self._zlp_title(active_entry.energy_axis_raw[active_fit_mask], active_zlp_profile)
         )
         fit_ax.set_xlabel("Energy loss (eV)")
         fit_ax.set_ylabel(spectra_label)
@@ -1522,8 +1564,7 @@ plt.show()
         self._update_map_histogram()
 
     def _update_map_histogram(self):
-        self.map_hist_canvas.figure.clear()
-        ax = self.map_hist_canvas.figure.add_subplot(111)
+        ax = self.map_hist_canvas.reset_axis()
         image = self._map_intensity_image()
         polygon_mask = self._current_polygon_mask()
         if image is None or polygon_mask is None or not polygon_mask.any():
@@ -1532,10 +1573,10 @@ plt.show()
             self.map_hist_canvas.draw_idle()
             return
         values = image[polygon_mask]
-        ax.hist(values, bins=64, color="0.5", edgecolor="0.3")
+        ax.hist(values, bins=64, color=PLOT_MAIN, edgecolor=SPINE)
         z_min, z_max = self._map_intensity_range_values()
-        ax.axvline(z_min, color="royalblue", linewidth=1.2)
-        ax.axvline(z_max, color="crimson", linewidth=1.2)
+        ax.axvline(z_min, color=PLOT_PREVIEW, linewidth=1.2)
+        ax.axvline(z_max, color=PLOT_FIT, linewidth=1.2)
         ax.set_title("Polygon intensity histogram")
         ax.set_xlabel("Integrated intensity")
         ax.set_ylabel("Pixels")
@@ -1551,8 +1592,7 @@ plt.show()
     def _update_map_mask_preview(self):
         if self._current_mode_index() != 0:
             return
-        self.corrected_canvas.figure.clear()
-        ax = self.corrected_canvas.figure.add_subplot(111)
+        ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
         image = self._map_intensity_image()
         polygon_mask = self._current_polygon_mask()
         if image is None or polygon_mask is None:
@@ -1591,8 +1631,7 @@ plt.show()
             self._image_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
 
         self._detach_selector()
-        self.image_canvas.figure.clear()
-        ax = self.image_canvas.figure.add_subplot(111)
+        ax = self._prepare_image_axis(self.image_canvas.reset_axis())
         if self.loaded is None:
             ax.text(0.5, 0.5, "Load an EELS dataset to start", ha="center", va="center")
             ax.set_axis_off()
@@ -1726,7 +1765,7 @@ plt.show()
                     self.map_polygon_vertices,
                     closed=True,
                     fill=False,
-                    edgecolor="cyan",
+                    edgecolor=PLOT_PREVIEW,
                     linewidth=1.5,
                 )
                 ax.add_patch(self.selection_polygon)
@@ -1742,7 +1781,7 @@ plt.show()
             y1 = self.stack_y1.value()
         width = max(1, x1 - x0)
         height = max(1, y1 - y0)
-        self.selection_rect = Rectangle((x0, y0), width, height, fill=False, edgecolor="cyan", linewidth=1.5)
+        self.selection_rect = Rectangle((x0, y0), width, height, fill=False, edgecolor=PLOT_PREVIEW, linewidth=1.5)
         ax.add_patch(self.selection_rect)
         if (
             self._current_mode_index() == 1
@@ -1932,26 +1971,26 @@ else:
     ax1.axis("off")
 
 ax2 = fig.add_subplot(gs[0, 2])
-ax2.plot(arrays["zlp_x"], arrays["zlp_y_integrated"], "k.", markersize=3, label="integrated")
-ax2.plot(arrays["zlp_x"], arrays["zlp_fit"], color="crimson", linewidth=1.2, label="fit")
-ax2.axvline(arrays["zlp_center_ev"][0], color="royalblue", linestyle="--", linewidth=1.0)
+ax2.plot(arrays["zlp_x"], arrays["zlp_y_integrated"], ".", color="#f2f2f2", markersize=3, label="integrated")
+ax2.plot(arrays["zlp_x"], arrays["zlp_fit"], color="#ff4d6d", linewidth=1.2, label="fit")
+ax2.axvline(arrays["zlp_center_ev"][0], color="#3b82f6", linestyle="--", linewidth=1.0)
 if "zlp_snapshot_x" in arrays and arrays["zlp_snapshot_x"].size:
     scale = arrays["zlp_snapshot_scale"][0]
     snap_index = int(arrays["snapshot_index"][0])
     ax2.plot(
         arrays["zlp_snapshot_x"],
         arrays["zlp_snapshot_y_scaled"],
-        color="darkorange",
+        color="#f59e0b",
         linewidth=1.0,
         label=f"snapshot {{snap_index}} (scaled x{{scale:.2f}})",
     )
-ax2.set_title("ZLP, aligned")
+ax2.set_title(f"ZLP, aligned (FWHM = {curve_fwhm(arrays['zlp_x'], arrays['zlp_fit']):.2e} eV)")
 ax2.set_xlabel("Energy loss (eV)")
 ax2.set_ylabel("ZLP region")
 ax2.legend(loc="lower left", fontsize=8)
 
 ax3 = fig.add_subplot(gs[1, :])
-ax3.plot(spectrum_xy[:, 0], spectrum_xy[:, 1], color="black", linewidth=1.0)
+ax3.plot(spectrum_xy[:, 0], spectrum_xy[:, 1], color="#f2f2f2", linewidth=1.0)
 ax3.set_xlabel("Energy loss (eV, ZLP corrected)")
 ax3.set_ylabel("Intensity (a.u.)")
 sec = ax3.secondary_xaxis("top", functions=(lambda x: x * 8065.54429, lambda x: x / 8065.54429))
@@ -2111,8 +2150,7 @@ plt.show()
             current_ax = self.image_canvas.figure.axes[0]
             self._image_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
         self._detach_selector()
-        self.image_canvas.figure.clear()
-        image_ax = self.image_canvas.figure.add_subplot(111)
+        image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
 
         if isinstance(result, MapProcessingResult):
             im = image_ax.imshow(result.intensity_image, cmap="inferno", origin="upper")
@@ -2135,7 +2173,7 @@ plt.show()
                     (0, self.stack_y0.value()),
                     detector_image.shape[1],
                     band_height,
-                    edgecolor="cyan",
+                    edgecolor=PLOT_PREVIEW,
                     fill=False,
                     linewidth=1.5,
                 )
@@ -2154,11 +2192,10 @@ plt.show()
         self._attach_selector()
         self._update_selection_overlay()
 
-        self.corrected_canvas.figure.clear()
         if isinstance(result, StackProcessingResult) and self.corrected_canvas.figure.axes:
             current_ax = self.corrected_canvas.figure.axes[0]
             self._corrected_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
-        corrected_ax = self.corrected_canvas.figure.add_subplot(111)
+        corrected_ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
         if isinstance(result, StackProcessingResult):
             corrected_image = self._current_snapshot_aligned_image()
             if corrected_image is not None:
@@ -2183,14 +2220,13 @@ plt.show()
             corrected_ax.set_ylabel("")
         self.corrected_canvas.draw_idle()
 
-        self.fit_canvas.figure.clear()
-        fit_ax = self.fit_canvas.figure.add_subplot(111)
+        fit_ax = self.fit_canvas.reset_axis()
         if isinstance(result, StackProcessingResult):
-            fit_ax.plot(result.zero_loss_fit.fit_x, result.zero_loss_fit.fit_y, "k.", markersize=3)
-            fit_ax.plot(result.zero_loss_fit.fit_x, result.zero_loss_fit.best_fit, color="crimson", linewidth=1.2)
+            fit_ax.plot(result.zero_loss_fit.fit_x, result.zero_loss_fit.fit_y, ".", color=PLOT_MAIN, markersize=3)
+            fit_ax.plot(result.zero_loss_fit.fit_x, result.zero_loss_fit.best_fit, color=PLOT_FIT, linewidth=1.2)
             fit_ax.axvline(
                 result.zero_loss_fit.center_ev,
-                color="royalblue",
+                color=PLOT_PREVIEW,
                 linewidth=1.0,
                 linestyle="--",
                 label=f"centroid = {result.zero_loss_fit.center_ev:.5f} eV",
@@ -2208,7 +2244,7 @@ plt.show()
                 fit_ax.plot(
                     result.energy_axis_raw[fit_mask],
                     snapshot_fit_y * scale,
-                    color="darkorange",
+                    color=PLOT_WARNING,
                     linewidth=1.0,
                     alpha=0.9,
                     label=f"snapshot {self.snapshot_index_spin.value()} (scaled x{scale:.2f})",
@@ -2223,14 +2259,14 @@ plt.show()
                 fit_ax.plot(
                     result.energy_axis_raw[fit_mask],
                     row,
-                    color="0.5",
+                    color=PLOT_MAIN,
                     linewidth=0.6,
                     alpha=0.25,
                     label="individually aligned spectra" if index == 0 else None,
                 )
             fit_ax.axvline(
                 0.0,
-                color="royalblue",
+                color=PLOT_PREVIEW,
                 linewidth=1.0,
                 linestyle=":",
                 label="_nolegend_",
@@ -2238,20 +2274,21 @@ plt.show()
             fit_ax.plot(
                 result.zero_loss_fit.fit_x,
                 result.zero_loss_fit.fit_y,
-                "k.",
+                ".",
+                color=PLOT_MAIN,
                 markersize=3,
                 label="summed after alignment",
             )
             fit_ax.plot(
                 result.zero_loss_fit.fit_x,
                 result.zero_loss_fit.best_fit,
-                color="crimson",
+                color=PLOT_FIT,
                 linewidth=1.2,
                 label="fit of aligned sum",
             )
             fit_ax.axvline(
                 result.zero_loss_fit.center_ev,
-                color="darkorange",
+                color=PLOT_WARNING,
                 linewidth=1.0,
                 linestyle="--",
                 label=f"residual centroid = {result.zero_loss_fit.center_ev:.5f} eV",
@@ -2259,17 +2296,18 @@ plt.show()
         fit_ax.set_xlabel("Energy loss (eV)")
         fit_ax.set_ylabel("Intensity")
         fit_ax.set_title(
-            "ZLP, aligned"
-            if isinstance(result, StackProcessingResult)
-            else f"ZLP (FWHM = {self._curve_fwhm(result.zero_loss_fit.fit_x, result.zero_loss_fit.best_fit):.2e} eV)"
+            self._zlp_title(
+                result.zero_loss_fit.fit_x,
+                result.zero_loss_fit.best_fit,
+                aligned=isinstance(result, StackProcessingResult),
+            )
         )
         fit_ax.legend(loc="lower left", fontsize=8)
 
         self.fit_canvas.draw_idle()
 
-        self.spectrum_canvas.figure.clear()
-        spectrum_ax = self.spectrum_canvas.figure.add_subplot(111)
-        spectrum_ax.plot(cal_axis, result.summed_spectrum, color="black", linewidth=1.0)
+        spectrum_ax = self.spectrum_canvas.reset_axis()
+        spectrum_ax.plot(cal_axis, result.summed_spectrum, color=PLOT_MAIN, linewidth=1.0)
         spectrum_ax.set_xlabel("Energy loss (eV, ZLP corrected)")
         spectrum_ax.set_ylabel("Intensity (a.u.)")
         spectrum_ax.set_title(self._current_filename_label())
@@ -2278,6 +2316,7 @@ plt.show()
             functions=(lambda x: x * EV_TO_CMINV, lambda x: x / EV_TO_CMINV),
         )
         spectrum_ax_top.set_xlabel(r"Wavenumber (cm$^{-1}$)")
+        style_secondary_axis(spectrum_ax_top)
         self.spectrum_canvas.draw_idle()
 
         self.zlp_center_label.setText(f"{result.zero_loss_fit.center_ev:.6f} eV")
@@ -2349,7 +2388,7 @@ plt.show()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setStyle("Fusion")
+    apply_qt_theme(app)
     window = VibeelsWindow()
     window.show()
     return app.exec()

@@ -33,6 +33,7 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+.vscode/**
 
 # Local app/output artifacts
 vibeels-analysis/
