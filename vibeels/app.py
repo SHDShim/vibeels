@@ -31,7 +31,6 @@ from .processing import (
     EV_TO_CMINV,
     MapProcessingResult,
     StackProcessingResult,
-    align_spectra_1d,
     load_signal,
     process_map_dataset,
     process_snapshot_stack,
@@ -118,6 +117,49 @@ class PlotCanvas(FigureCanvas):
         return axis
 
 
+class ProcessingWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int, int, str)
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        mode_index: int,
+        signal,
+        map_kwargs: Optional[dict[str, object]] = None,
+        snapshot_kwargs: Optional[dict[str, object]] = None,
+    ):
+        super().__init__()
+        self.mode_index = mode_index
+        self.signal = signal
+        self.map_kwargs = map_kwargs or {}
+        self.snapshot_kwargs = snapshot_kwargs or {}
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            if self.mode_index == 0:
+                result = process_map_dataset(
+                    self.signal,
+                    progress_callback=self._emit_progress,
+                    **self.map_kwargs,
+                )
+            else:
+                result = process_snapshot_stack(
+                    self.signal,
+                    progress_callback=self._emit_progress,
+                    **self.snapshot_kwargs,
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(result)
+
+    def _emit_progress(self, current: int, total: int, message: str):
+        self.progress.emit(int(current), int(total), str(message))
+
+
 class VibeelsWindow(QtWidgets.QMainWindow):
     SETTINGS_GROUP = "paths"
     LAST_DATA_DIR_KEY = "last_data_dir"
@@ -143,6 +185,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self._updating_saved_map_table = False
         self.saved_state_records: list[SavedStateRecord] = []
         self._updating_saved_state_table = False
+        self.processing_thread: Optional[QtCore.QThread] = None
+        self.processing_worker: Optional[ProcessingWorker] = None
+        self._last_progress_message: Optional[str] = None
 
         self._build_ui()
         self._apply_default_ranges()
@@ -211,6 +256,14 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         right_layout.setContentsMargins(8, 8, 8, 8)
         self.tabs = QtWidgets.QTabWidget()
         right_layout.addWidget(self.tabs, 1)
+        self.progress_label = QtWidgets.QLabel("Idle")
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        progress_layout = QtWidgets.QVBoxLayout()
+        progress_layout.addWidget(self.progress_label)
+        progress_layout.addWidget(self.progress_bar)
+        right_layout.addLayout(progress_layout)
         self.status_box = QtWidgets.QPlainTextEdit()
         self.status_box.setReadOnly(True)
         self.status_box.setMaximumHeight(160)
@@ -245,12 +298,13 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         layout.addRow(load_eels)
         layout.addRow("EELS file", self.eels_path_label)
         layout.addRow("Loaded shape", self.shape_label)
-        layout.addRow(refresh)
-        layout.addRow(export_button)
+        action_buttons = QtWidgets.QHBoxLayout()
+        action_buttons.addWidget(refresh, 1)
+        action_buttons.addWidget(export_button, 1)
+        layout.addRow(action_buttons)
         state_buttons = QtWidgets.QHBoxLayout()
-        state_buttons.addWidget(save_state)
-        state_buttons.addWidget(load_state)
-        state_buttons.addStretch(1)
+        state_buttons.addWidget(save_state, 1)
+        state_buttons.addWidget(load_state, 1)
         layout.addRow("Saved states", state_buttons)
 
         self.saved_state_table = QtWidgets.QTableWidget(0, 3)
@@ -356,12 +410,24 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.enable_selector,
         ]
 
-        layout.addRow("Map energy start", self.energy_start_spin)
-        layout.addRow("Map energy stop", self.energy_stop_spin)
-        layout.addRow("ROI x start", self.roi_x0)
-        layout.addRow("ROI x stop", self.roi_x1)
-        layout.addRow("ROI y start", self.roi_y0)
-        layout.addRow("ROI y stop", self.roi_y1)
+        map_grid = QtWidgets.QGridLayout()
+        map_grid.addWidget(QtWidgets.QLabel("Map energy start"), 0, 0)
+        map_grid.addWidget(self.energy_start_spin, 0, 1)
+        map_grid.addWidget(QtWidgets.QLabel("Map energy stop"), 0, 2)
+        map_grid.addWidget(self.energy_stop_spin, 0, 3)
+        map_grid.addWidget(QtWidgets.QLabel("ROI x start"), 1, 0)
+        map_grid.addWidget(self.roi_x0, 1, 1)
+        map_grid.addWidget(QtWidgets.QLabel("ROI x stop"), 1, 2)
+        map_grid.addWidget(self.roi_x1, 1, 3)
+        map_grid.addWidget(QtWidgets.QLabel("ROI y start"), 2, 0)
+        map_grid.addWidget(self.roi_y0, 2, 1)
+        map_grid.addWidget(QtWidgets.QLabel("ROI y stop"), 2, 2)
+        map_grid.addWidget(self.roi_y1, 2, 3)
+        map_grid.setColumnStretch(0, 0)
+        map_grid.setColumnStretch(1, 1)
+        map_grid.setColumnStretch(2, 0)
+        map_grid.setColumnStretch(3, 1)
+        layout.addRow(map_grid)
         layout.addRow(self.enable_selector)
         layout.addRow(self.map_mask_min_label)
         layout.addRow(self.map_mask_min_slider)
@@ -380,8 +446,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.snapshot_index_spin = QtWidgets.QSpinBox()
         self.snapshot_index_spin.setMaximum(0)
         self.snapshot_index_spin.valueChanged.connect(self._on_snapshot_index_changed)
-        self.snapshot_prev_button = self._make_button("Previous Snapshot", self._show_previous_snapshot)
-        self.snapshot_next_button = self._make_button("Next Snapshot", self._show_next_snapshot)
+        self.snapshot_prev_button = self._make_button("Previous", self._show_previous_snapshot)
+        self.snapshot_next_button = self._make_button("Next", self._show_next_snapshot)
         for widget in [self.stack_y0, self.stack_y1, self.frame_start, self.frame_stop]:
             widget.setMaximum(100000)
         self.stack_y0.valueChanged.connect(self._update_selection_overlay)
@@ -404,13 +470,25 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.snapshot_next_button,
         ]
 
-        layout.addRow("Snapshot index", self.snapshot_index_spin)
-        layout.addRow(self.snapshot_prev_button)
-        layout.addRow(self.snapshot_next_button)
-        layout.addRow("Detector y start", self.stack_y0)
-        layout.addRow("Detector y stop", self.stack_y1)
-        layout.addRow("Snapshot start", self.frame_start)
-        layout.addRow("Snapshot stop", self.frame_stop)
+        snapshot_nav_row = QtWidgets.QHBoxLayout()
+        snapshot_nav_row.addWidget(self.snapshot_index_spin, 1)
+        snapshot_nav_row.addWidget(self.snapshot_prev_button, 1)
+        snapshot_nav_row.addWidget(self.snapshot_next_button, 1)
+        range_grid = QtWidgets.QGridLayout()
+        range_grid.addWidget(QtWidgets.QLabel("Detector y start"), 0, 0)
+        range_grid.addWidget(self.stack_y0, 0, 1)
+        range_grid.addWidget(QtWidgets.QLabel("Detector y stop"), 0, 2)
+        range_grid.addWidget(self.stack_y1, 0, 3)
+        range_grid.addWidget(QtWidgets.QLabel("Snapshot start"), 1, 0)
+        range_grid.addWidget(self.frame_start, 1, 1)
+        range_grid.addWidget(QtWidgets.QLabel("Snapshot stop"), 1, 2)
+        range_grid.addWidget(self.frame_stop, 1, 3)
+        range_grid.setColumnStretch(0, 0)
+        range_grid.setColumnStretch(1, 1)
+        range_grid.setColumnStretch(2, 0)
+        range_grid.setColumnStretch(3, 1)
+        layout.addRow("Snapshot index", snapshot_nav_row)
+        layout.addRow(range_grid)
         layout.addRow(process_button)
 
         self.spot_tab_index = self.tabs.addTab(tab, "1D Spot")
@@ -439,10 +517,20 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.axis_span_label = QtWidgets.QLabel("-")
         process_button = self._make_button("Run Zero-Loss Calibration", self._process_current)
 
-        layout.addRow("Fit start (eV)", self.fit_start_spin)
-        layout.addRow("Fit stop (eV)", self.fit_stop_spin)
-        layout.addRow("Guess start (eV)", self.guess_start_spin)
-        layout.addRow("Guess stop (eV)", self.guess_stop_spin)
+        calibration_grid = QtWidgets.QGridLayout()
+        calibration_grid.addWidget(QtWidgets.QLabel("Fit start (eV)"), 0, 0)
+        calibration_grid.addWidget(self.fit_start_spin, 0, 1)
+        calibration_grid.addWidget(QtWidgets.QLabel("Fit stop (eV)"), 0, 2)
+        calibration_grid.addWidget(self.fit_stop_spin, 0, 3)
+        calibration_grid.addWidget(QtWidgets.QLabel("Guess start (eV)"), 1, 0)
+        calibration_grid.addWidget(self.guess_start_spin, 1, 1)
+        calibration_grid.addWidget(QtWidgets.QLabel("Guess stop (eV)"), 1, 2)
+        calibration_grid.addWidget(self.guess_stop_spin, 1, 3)
+        calibration_grid.setColumnStretch(0, 0)
+        calibration_grid.setColumnStretch(1, 1)
+        calibration_grid.setColumnStretch(2, 0)
+        calibration_grid.setColumnStretch(3, 1)
+        layout.addRow(calibration_grid)
         layout.addRow("Zero-loss center", self.zlp_center_label)
         layout.addRow("Selected spectra", self.pixel_count_label)
         layout.addRow("Calibrated axis", self.axis_span_label)
@@ -500,6 +588,71 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
     def _log(self, message: str):
         self.status_box.appendPlainText(message)
+
+    def _set_progress(self, current: int, total: int, message: str):
+        total = max(1, int(total))
+        current = max(0, min(int(current), total))
+        percent = int(round((current / total) * 100))
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(percent)
+        self.progress_label.setText(message)
+
+    def _on_processing_progress(self, current: int, total: int, message: str):
+        self._set_progress(current, total, message)
+        if message != self._last_progress_message:
+            self._last_progress_message = message
+            self._log(message)
+
+    def _cleanup_processing_worker(self):
+        thread = self.processing_thread
+        self.processing_thread = None
+        self.processing_worker = None
+        if thread is not None:
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+
+    def _on_processing_finished(self, result):
+        self.current_result = result
+        self._render_result(result)
+        self._set_progress(100, 100, "Processing complete")
+        self._last_progress_message = None
+        self._log("Processing complete.")
+        self._cleanup_processing_worker()
+
+    def _on_processing_failed(self, message: str):
+        self._set_progress(0, 100, "Processing failed")
+        self._last_progress_message = None
+        self._log(f"Processing failed: {message}")
+        self._cleanup_processing_worker()
+
+    def _start_processing_worker(self, *, mode_index: int, map_kwargs=None, snapshot_kwargs=None):
+        if self.processing_thread is not None:
+            self._log("Processing is already running.")
+            return
+
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Starting processing")
+        self._last_progress_message = None
+        self._log("Processing started.")
+
+        self.processing_thread = QtCore.QThread(self)
+        self.processing_worker = ProcessingWorker(
+            mode_index=mode_index,
+            signal=self.loaded.eels_signal,
+            map_kwargs=map_kwargs,
+            snapshot_kwargs=snapshot_kwargs,
+        )
+        self.processing_worker.moveToThread(self.processing_thread)
+        self.processing_thread.started.connect(self.processing_worker.run)
+        self.processing_worker.progress.connect(self._on_processing_progress)
+        self.processing_worker.finished.connect(self._on_processing_finished)
+        self.processing_worker.failed.connect(self._on_processing_failed)
+        self.processing_worker.finished.connect(self.processing_thread.quit)
+        self.processing_worker.failed.connect(self.processing_thread.quit)
+        self.processing_thread.finished.connect(self.processing_worker.deleteLater)
+        self.processing_thread.start()
 
     def _make_checkbox_table_item(self, checked: bool) -> QtWidgets.QTableWidgetItem:
         item = QtWidgets.QTableWidgetItem()
@@ -763,9 +916,14 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             return 0.0
         return float(x_values[mask][-1] - x_values[mask][0])
 
+    def _format_scientific(self, value: float, significant_digits: int = 3) -> str:
+        precision = max(0, int(significant_digits) - 1)
+        return f"{float(value):.{precision}e}"
+
     def _zlp_title(self, x_values: np.ndarray, y_values: np.ndarray, *, aligned: bool = False) -> str:
         prefix = "ZLP, aligned" if aligned else "ZLP"
-        return f"{prefix} (FWHM = {self._curve_fwhm(x_values, y_values):.2e} eV)"
+        fwhm = self._curve_fwhm(x_values, y_values)
+        return f"{prefix} (FWHM = {self._format_scientific(fwhm)} eV)"
 
     def _format_colorbar_scientific(self, colorbar):
         formatter = ticker.ScalarFormatter(useMathText=True)
@@ -885,6 +1043,10 @@ if shown:
             return 0.0
         return float(x_values[mask][-1] - x_values[mask][0])
 
+    def format_scientific(value, significant_digits=3):
+        precision = max(0, int(significant_digits) - 1)
+        return f"{float(value):.{precision}e}"
+
     first_prefix = f"saved_map_{shown[0][0]}"
     first_selected = np.asarray(arrays[f"{first_prefix}_selected_spectra"], dtype=float)
     if first_selected.ndim == 1:
@@ -925,7 +1087,7 @@ if shown:
     ax_mask.set_title("Masked ROI")
     ax_zlp.axvline(0.0, color="#3b82f6", linestyle=":", linewidth=1.0, label="alignment target")
     ax_zlp.set_title(
-        f"ZLP (FWHM = {curve_fwhm(arrays[f'{first_prefix}_energy_axis_raw'], np.sum(first_selected, axis=0)):.2e} eV)"
+        f"ZLP (FWHM = {format_scientific(curve_fwhm(arrays[f'{first_prefix}_energy_axis_raw'], np.sum(first_selected, axis=0)))} eV)"
     )
     ax_zlp.set_xlabel("Energy loss (eV)")
     ax_zlp.set_ylabel("ZLP region")
@@ -1659,18 +1821,12 @@ plt.show()
             ax.set_ylabel("")
             self._apply_saved_image_view(ax, detector_image.shape[1], detector_image.shape[0])
 
-        overlay_image = self._reference_image_for_map_overlay()
         if self.loaded.image_signal is not None and np.asarray(self.loaded.image_signal.data).ndim >= 2:
             if mode_index != 0:
                 self.image_canvas.draw_idle()
                 self._attach_selector()
                 self._update_selection_overlay()
                 return
-            if overlay_image is not None:
-                try:
-                    ax.imshow(overlay_image, cmap="gray", alpha=0.25, origin="upper")
-                except Exception:
-                    pass
 
         self.image_canvas.draw_idle()
         self._attach_selector()
@@ -1947,6 +2103,24 @@ arrays = np.load(bundle_dir / f"{{stem}}_graph_data.npz")
 params = json.loads((bundle_dir / f"{{stem}}.json").read_text())
 spectrum_xy = np.loadtxt(bundle_dir / f"{{stem}}.xy", skiprows=1)
 
+def curve_fwhm(x_values, y_values):
+    x_values = np.asarray(x_values, dtype=float)
+    y_values = np.asarray(y_values, dtype=float)
+    if x_values.size < 2 or y_values.size < 2:
+        return 0.0
+    peak = float(np.max(y_values))
+    if peak <= 0:
+        return 0.0
+    half_max = peak / 2.0
+    mask = y_values >= half_max
+    if not np.any(mask):
+        return 0.0
+    return float(x_values[mask][-1] - x_values[mask][0])
+
+def format_scientific(value, significant_digits=3):
+    precision = max(0, int(significant_digits) - 1)
+    return f"{{float(value):.{{precision}}e}}"
+
 fig = plt.figure(figsize=(14, 8), constrained_layout=True)
 gs = fig.add_gridspec(2, 3)
 
@@ -1984,7 +2158,7 @@ if "zlp_snapshot_x" in arrays and arrays["zlp_snapshot_x"].size:
         linewidth=1.0,
         label=f"snapshot {{snap_index}} (scaled x{{scale:.2f}})",
     )
-ax2.set_title(f"ZLP, aligned (FWHM = {curve_fwhm(arrays['zlp_x'], arrays['zlp_fit']):.2e} eV)")
+ax2.set_title(f"ZLP, aligned (FWHM = {format_scientific(curve_fwhm(arrays['zlp_x'], arrays['zlp_fit']))} eV)")
 ax2.set_xlabel("Energy loss (eV)")
 ax2.set_ylabel("ZLP region")
 ax2.legend(loc="lower left", fontsize=8)
@@ -2080,27 +2254,32 @@ plt.show()
         self._draw_initial_image()
 
     def _current_snapshot_spectrum(self) -> Optional[np.ndarray]:
-        if self.loaded is None or self._current_mode_index() != 1:
+        if (
+            self.loaded is None
+            or self._current_mode_index() != 1
+            or not isinstance(self.current_result, StackProcessingResult)
+        ):
             return None
-        data = np.asarray(self.loaded.eels_signal.data)
-        if data.ndim != 3:
+        aligned_stack = np.asarray(self.current_result.aligned_stack, dtype=float)
+        if aligned_stack.ndim != 3 or aligned_stack.shape[0] == 0:
             return None
-        frame_index = min(self.snapshot_index_spin.value(), data.shape[0] - 1)
-        y0 = max(0, min(self.stack_y0.value(), data.shape[1] - 1))
-        y1 = max(y0 + 1, min(self.stack_y1.value(), data.shape[1]))
-        aligned_rows = align_spectra_1d(data[frame_index, y0:y1, :].copy())
-        return aligned_rows.sum(axis=0)
+        frame_offset = min(self.snapshot_index_spin.value() - self.frame_start.value(), aligned_stack.shape[0] - 1)
+        frame_offset = max(0, frame_offset)
+        return aligned_stack[frame_offset].sum(axis=0)
 
     def _current_snapshot_aligned_image(self) -> Optional[np.ndarray]:
-        if self.loaded is None or self._current_mode_index() != 1:
+        if (
+            self.loaded is None
+            or self._current_mode_index() != 1
+            or not isinstance(self.current_result, StackProcessingResult)
+        ):
             return None
-        data = np.asarray(self.loaded.eels_signal.data)
-        if data.ndim != 3:
+        aligned_stack = np.asarray(self.current_result.aligned_stack, dtype=float)
+        if aligned_stack.ndim != 3 or aligned_stack.shape[0] == 0:
             return None
-        frame_index = min(self.snapshot_index_spin.value(), data.shape[0] - 1)
-        y0 = max(0, min(self.stack_y0.value(), data.shape[1] - 1))
-        y1 = max(y0 + 1, min(self.stack_y1.value(), data.shape[1]))
-        return align_spectra_1d(data[frame_index, y0:y1, :].copy())
+        frame_offset = min(self.snapshot_index_spin.value() - self.frame_start.value(), aligned_stack.shape[0] - 1)
+        frame_offset = max(0, frame_offset)
+        return aligned_stack[frame_offset]
 
     def _fit_window(self):
         return (self.fit_start_spin.value(), self.fit_stop_spin.value())
@@ -2112,38 +2291,40 @@ plt.show()
         if self.loaded is None or not self.loaded.eels_path:
             self._log("Load an EELS dataset before processing.")
             return
-        try:
-            if self._current_mode_index() == 0:
-                polygon_mask = self._current_polygon_mask()
-                if polygon_mask is None:
-                    raise ValueError("Map polygon ROI is not available.")
-                result = process_map_dataset(
-                    self.loaded.eels_signal,
-                    energy_range=(self.energy_start_spin.value(), self.energy_stop_spin.value()),
-                    polygon_mask=polygon_mask,
-                    intensity_range=self._map_intensity_range_values(),
-                    display_image=self._current_display_image(),
-                    fit_window=self._fit_window(),
-                    guess_window=self._guess_window(),
-                )
-            else:
-                result = process_snapshot_stack(
-                    self.loaded.eels_signal,
-                    vertical_range=(self.stack_y0.value(), self.stack_y1.value()),
-                    frame_range=(self.frame_start.value(), self.frame_stop.value()),
-                    fit_window=self._fit_window(),
-                    guess_window=self._guess_window(),
-                )
-        except Exception as exc:
-            self._log(f"Processing failed: {exc}")
+        mode_index = self._current_mode_index()
+        if mode_index == 0:
+            polygon_mask = self._current_polygon_mask()
+            if polygon_mask is None:
+                self._log("Processing failed: Map polygon ROI is not available.")
+                return
+            self._start_processing_worker(
+                mode_index=mode_index,
+                map_kwargs={
+                    "energy_range": (self.energy_start_spin.value(), self.energy_stop_spin.value()),
+                    "polygon_mask": polygon_mask,
+                    "intensity_range": self._map_intensity_range_values(),
+                    "display_image": self._current_display_image(),
+                    "fit_window": self._fit_window(),
+                    "guess_window": self._guess_window(),
+                },
+            )
             return
 
-        self.current_result = result
-        self._render_result(result)
-        self._log("Processing complete.")
+        self._start_processing_worker(
+            mode_index=mode_index,
+            snapshot_kwargs={
+                "vertical_range": (self.stack_y0.value(), self.stack_y1.value()),
+                "frame_range": (self.frame_start.value(), self.frame_stop.value()),
+                "fit_window": self._fit_window(),
+                "guess_window": self._guess_window(),
+            },
+        )
 
     def _current_display_image(self):
-        return self._reference_image_for_map_overlay()
+        image = self._map_intensity_image()
+        if image is not None:
+            return np.asarray(image, dtype=float)
+        return None
 
     def _render_result(self, result):
         if isinstance(result, StackProcessingResult) and self.image_canvas.figure.axes:

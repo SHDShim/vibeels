@@ -1,2 +1,2 @@
 - [x] It looks like alignment is not happening for the 2D map case.  Test this and fix this.
-- [ ] add two specra from different alignment region to enhance the intensity.  The alignment is struggling.  Use jupyternotebook version and check if there is any problem in code implementation from Jupyter to vibeels app.
+- [ ] check snapshots alignment for map case.

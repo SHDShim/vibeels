@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from threading import Lock
+from typing import Callable, Optional, Sequence, Tuple
 
 import hyperspy.api as hs
 import numpy as np
+from joblib import Parallel, delayed
 from lmfit.models import LinearModel, PseudoVoigtModel
 
 
 EV_TO_CMINV = 8065.54429
+ProgressCallback = Callable[[int, int, str], None]
 
 
 @dataclass
@@ -118,6 +121,16 @@ def rectangle_mask(
     mask = np.zeros((height, width), dtype=bool)
     mask[y_start:y_stop, x_start:x_stop] = True
     return mask
+
+
+def emit_progress(
+    progress_callback: Optional[ProgressCallback],
+    current: int,
+    total: int,
+    message: str,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(int(current), int(total), str(message))
 
 
 def fit_zero_loss_peak(
@@ -261,7 +274,9 @@ def process_map_dataset(
     display_image: Optional[np.ndarray] = None,
     fit_window: Tuple[float, float] = (-0.05, 0.05),
     guess_window: Tuple[float, float] = (-0.04, 0.04),
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> MapProcessingResult:
+    emit_progress(progress_callback, 0, 4, "Preparing map ROI")
     if signal.data.ndim != 3:
         raise ValueError("Map mode expects a 3D dataset shaped like (y, x, energy).")
 
@@ -280,6 +295,7 @@ def process_map_dataset(
     if selected_spectra.size == 0:
         raise ValueError("No pixels passed the current polygon ROI and intensity range.")
 
+    emit_progress(progress_callback, 1, 4, "Fitting individual ZLP centers")
     energy_axis = spectral_axis_from_signal(signal, selected_spectra.shape[1])
     individual_fits = [
         fit_zero_loss_peak(
@@ -291,6 +307,7 @@ def process_map_dataset(
         for spectrum in selected_spectra
     ]
     centers = np.asarray([fit.center_ev for fit in individual_fits], dtype=float)
+    emit_progress(progress_callback, 2, 4, "Aligning selected spectra")
     aligned_spectra = np.asarray(
         [
             align_spectrum_to_center(energy_axis, spectrum, center_ev)
@@ -299,12 +316,14 @@ def process_map_dataset(
         dtype=float,
     )
     summed_spectrum = aligned_spectra.sum(axis=0)
+    emit_progress(progress_callback, 3, 4, "Fitting summed ZLP")
     zlp_fit = fit_zero_loss_peak(
         energy_axis,
         summed_spectrum,
         fit_window=fit_window,
         guess_window=guess_window,
     )
+    emit_progress(progress_callback, 4, 4, "Map processing complete")
 
     return MapProcessingResult(
         intensity_image=np.asarray(intensity_image, dtype=float),
@@ -331,7 +350,9 @@ def process_snapshot_stack(
     frame_range: Optional[Tuple[int, int]] = None,
     fit_window: Tuple[float, float] = (-0.05, 0.05),
     guess_window: Tuple[float, float] = (-0.04, 0.04),
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> StackProcessingResult:
+    emit_progress(progress_callback, 0, 100, "Preparing snapshot stack")
     if signal.data.ndim != 3:
         raise ValueError(
             "Snapshot-stack mode expects a 3D dataset shaped like (frame, y, energy)."
@@ -346,22 +367,49 @@ def process_snapshot_stack(
         f_start, f_stop = ensure_range(frame_range[0], frame_range[1], frames)
 
     detector_image_raw = data[f_start:f_stop].sum(axis=0)
-    slices = []
-    for index in range(f_start, f_stop):
-        aligned_slice = align_spectra_1d(data[index, y_start:y_stop, :].copy())
-        slices.append(np.asarray(aligned_slice, dtype=float))
+    data_slices = [np.asarray(data[index, y_start:y_stop, :], dtype=float) for index in range(f_start, f_stop)]
+    total_slices = len(data_slices)
+    completed_slices = 0
+    completed_lock = Lock()
 
-    aligned_stack = np.asarray(slices, dtype=float)
-    aligned_stack = align_stack_2d(aligned_stack.copy())
+    def process_signal_slice(data_slice: np.ndarray) -> np.ndarray:
+        nonlocal completed_slices
+        signal_slice = hs.signals.Signal1D(data_slice)
+        signal_slice.align1D(crop=False, fill_value=0.0)
+        aligned_data = np.asarray(signal_slice.data, dtype=float)
+        with completed_lock:
+            completed_slices += 1
+            slice_progress = completed_slices
+        slice_percent = int(round((slice_progress / max(1, total_slices)) * 80))
+        emit_progress(
+            progress_callback,
+            min(slice_percent, 80),
+            100,
+            f"Aligning 1D slices ({slice_progress}/{total_slices})",
+        )
+        return aligned_data
+
+    aligned_slices = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(process_signal_slice)(data_slice) for data_slice in data_slices
+    )
+
+    emit_progress(progress_callback, 85, 100, "Estimating 2D shifts")
+    aligned_stack_signal = hs.signals.Signal2D(np.asarray(aligned_slices, dtype=float))
+    shifts = aligned_stack_signal.estimate_shift2D()
+    emit_progress(progress_callback, 92, 100, "Applying 2D alignment")
+    aligned_stack_signal.align2D(shifts=shifts, crop=False, fill_value=0.0)
+    aligned_stack = np.asarray(aligned_stack_signal.data, dtype=float)
 
     summed_spectrum = aligned_stack.sum(axis=0).sum(axis=0)
     energy_axis = spectral_axis_from_signal(signal, summed_spectrum.shape[0])
+    emit_progress(progress_callback, 98, 100, "Fitting summed ZLP")
     zlp_fit = fit_zero_loss_peak(
         energy_axis,
         summed_spectrum,
         fit_window=fit_window,
         guess_window=guess_window,
     )
+    emit_progress(progress_callback, 100, 100, "Snapshot processing complete")
 
     return StackProcessingResult(
         detector_image_raw=np.asarray(detector_image_raw, dtype=float),
