@@ -55,6 +55,14 @@ def build_dark_palette() -> QPalette:
 def apply_qt_theme(app) -> None:
     app.setStyle("Fusion")
     app.setPalette(build_dark_palette())
+    app.setStyleSheet(
+        """
+        QSpinBox,
+        QDoubleSpinBox {
+            qproperty-alignment: AlignRight;
+        }
+        """
+    )
 
 
 def configure_matplotlib_defaults() -> None:

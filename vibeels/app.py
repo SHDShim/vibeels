@@ -198,8 +198,57 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self,
         text: str,
         slot=None,
+        variant: str = "default",
     ) -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton(text)
+        if variant == "success":
+            button.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #1f8f4d;
+                    border: 1px solid #29b765;
+                    border-radius: 4px;
+                    color: #f7fff9;
+                    min-height: 38px;
+                    padding: 4px 12px;
+                }
+                QPushButton:hover {
+                    background-color: #24a258;
+                }
+                QPushButton:pressed {
+                    background-color: #18733e;
+                }
+                QPushButton:disabled {
+                    background-color: #3d4a42;
+                    border: 1px solid #56645b;
+                    color: #aeb8b1;
+                }
+                """
+            )
+        elif variant == "danger":
+            button.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #9f2436;
+                    border: 1px solid #d24b62;
+                    border-radius: 4px;
+                    color: #fff7f8;
+                    min-height: 38px;
+                    padding: 4px 12px;
+                }
+                QPushButton:hover {
+                    background-color: #b12a3d;
+                }
+                QPushButton:pressed {
+                    background-color: #811d2c;
+                }
+                QPushButton:disabled {
+                    background-color: #4d3c40;
+                    border: 1px solid #655256;
+                    color: #c3b4b7;
+                }
+                """
+            )
         if slot is not None:
             button.clicked.connect(slot)
         return button
@@ -287,7 +336,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.eels_path_label = QtWidgets.QLabel("No EELS file loaded")
         self.eels_path_label.setWordWrap(True)
 
-        load_eels = self._make_button("Load EELS DM3/DM4", self._load_eels)
+        load_eels = self._make_button("Load EELS DM3/DM4", self._load_eels, variant="success")
         refresh = self._make_button("Process Current Settings", self._process_current)
         export_button = self._make_button("Export NPY", self._save_results)
         save_state = self._make_button("Save status", self._save_session_state)
@@ -328,7 +377,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(tab)
 
         controls = QtWidgets.QFormLayout()
-        load_image = self._make_button("Load Reference Image", self._load_image)
+        load_image = self._make_button("Load Reference Image", self._load_image, variant="success")
         self.image_path_label = QtWidgets.QLabel("Optional image not loaded")
         self.image_path_label.setWordWrap(True)
 
@@ -390,7 +439,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.map_hist_canvas = PlotCanvas((1, 1), self)
         self.map_hist_canvas.setMinimumHeight(180)
 
-        process_button = self._make_button("Apply ROI / Alignment", self._process_current)
+        process_button = self._make_button("Apply ROI / Alignment", self._process_current, variant="danger")
 
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QFormLayout(tab)
@@ -455,7 +504,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.frame_start.valueChanged.connect(self._draw_initial_image)
         self.frame_stop.valueChanged.connect(self._draw_initial_image)
 
-        process_button = self._make_button("Apply ROI / Alignment", self._process_current)
+        process_button = self._make_button("Apply ROI / Alignment", self._process_current, variant="danger")
 
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QFormLayout(tab)
@@ -515,7 +564,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.zlp_center_label = QtWidgets.QLabel("-")
         self.pixel_count_label = QtWidgets.QLabel("-")
         self.axis_span_label = QtWidgets.QLabel("-")
-        process_button = self._make_button("Run Zero-Loss Calibration", self._process_current)
+        process_button = self._make_button("Run Zero-Loss Calibration", self._process_current, variant="success")
 
         calibration_grid = QtWidgets.QGridLayout()
         calibration_grid.addWidget(QtWidgets.QLabel("Fit start (eV)"), 0, 0)
