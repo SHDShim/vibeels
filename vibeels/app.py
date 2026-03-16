@@ -17,7 +17,7 @@ import matplotlib
 matplotlib.use("QtAgg")
 
 import numpy as np
-from matplotlib import ticker
+from matplotlib import rcParams, ticker
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -31,7 +31,9 @@ from .processing import (
     EV_TO_CMINV,
     MapProcessingResult,
     StackProcessingResult,
+    describe_signal_layout,
     load_signal,
+    load_eels_signal,
     process_map_dataset,
     process_snapshot_stack,
 )
@@ -117,6 +119,155 @@ class PlotCanvas(FigureCanvas):
         return axis
 
 
+class RangeSlider(QtWidgets.QWidget):
+    valueChanged = QtCore.pyqtSignal(int, int)
+
+    def __init__(self, orientation=QtOrientation.Horizontal, parent=None):
+        super().__init__(parent)
+        self._orientation = orientation
+        self._minimum = 0
+        self._maximum = 100
+        self._lower_value = 0
+        self._upper_value = 100
+        self._active_handle: Optional[str] = None
+        self.setMouseTracking(True)
+        self.setMinimumHeight(28)
+
+    def minimum(self) -> int:
+        return self._minimum
+
+    def maximum(self) -> int:
+        return self._maximum
+
+    def lowerValue(self) -> int:
+        return self._lower_value
+
+    def upperValue(self) -> int:
+        return self._upper_value
+
+    def setRange(self, minimum: int, maximum: int):
+        self._minimum = int(minimum)
+        self._maximum = max(int(maximum), self._minimum)
+        self.setValues(self._lower_value, self._upper_value)
+
+    def setValues(self, lower: int, upper: int):
+        lower = self._clamp(int(lower))
+        upper = self._clamp(int(upper))
+        if lower > upper:
+            lower, upper = upper, lower
+        changed = lower != self._lower_value or upper != self._upper_value
+        self._lower_value = lower
+        self._upper_value = upper
+        self.update()
+        if changed:
+            self.valueChanged.emit(self._lower_value, self._upper_value)
+
+    def setLowerValue(self, value: int):
+        self.setValues(value, self._upper_value)
+
+    def setUpperValue(self, value: int):
+        self.setValues(self._lower_value, value)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(240, 32)
+
+    def paintEvent(self, _event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+
+        groove_rect = self._groove_rect()
+        lower_center = self._handle_center_x(self._lower_value)
+        upper_center = self._handle_center_x(self._upper_value)
+        selected_rect = QtCore.QRectF(
+            min(lower_center, upper_center),
+            groove_rect.top(),
+            abs(upper_center - lower_center),
+            groove_rect.height(),
+        )
+
+        painter.setPen(QtGui.QPen(QtGui.QColor("#202227"), 1))
+        painter.setBrush(QtGui.QColor("#3c4048"))
+        painter.drawRoundedRect(groove_rect, 3, 3)
+
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QColor("#6fb6ff"))
+        painter.drawRoundedRect(selected_rect, 3, 3)
+
+        for center_x in [lower_center, upper_center]:
+            handle_rect = self._handle_rect(center_x)
+            painter.setPen(QtGui.QPen(QtGui.QColor("#2a2d33"), 1))
+            painter.setBrush(QtGui.QColor("#535862"))
+            painter.drawRoundedRect(handle_rect, 4, 4)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
+        pos_x = event.position().x()
+        lower_center = self._handle_center_x(self._lower_value)
+        upper_center = self._handle_center_x(self._upper_value)
+        if abs(pos_x - lower_center) <= abs(pos_x - upper_center):
+            self._active_handle = "lower"
+        else:
+            self._active_handle = "upper"
+        self._set_active_from_position(pos_x)
+        event.accept()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent):
+        if self._active_handle is None:
+            event.ignore()
+            return
+        self._set_active_from_position(event.position().x())
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
+        self._active_handle = None
+        event.accept()
+
+    def _clamp(self, value: int) -> int:
+        return min(max(value, self._minimum), self._maximum)
+
+    def _groove_rect(self) -> QtCore.QRectF:
+        margin = 12.0
+        groove_height = 8.0
+        y = (self.height() - groove_height) / 2.0
+        return QtCore.QRectF(margin, y, max(1.0, self.width() - (margin * 2.0)), groove_height)
+
+    def _handle_rect(self, center_x: float) -> QtCore.QRectF:
+        handle_width = 12.0
+        handle_height = 22.0
+        y = (self.height() - handle_height) / 2.0
+        return QtCore.QRectF(center_x - handle_width / 2.0, y, handle_width, handle_height)
+
+    def _handle_center_x(self, value: int) -> float:
+        groove_rect = self._groove_rect()
+        span = self._maximum - self._minimum
+        if span <= 0:
+            return groove_rect.left()
+        ratio = (value - self._minimum) / span
+        return groove_rect.left() + (ratio * groove_rect.width())
+
+    def _value_from_position(self, pos_x: float) -> int:
+        groove_rect = self._groove_rect()
+        if groove_rect.width() <= 0:
+            return self._minimum
+        ratio = (pos_x - groove_rect.left()) / groove_rect.width()
+        ratio = min(max(ratio, 0.0), 1.0)
+        return int(round(self._minimum + ratio * (self._maximum - self._minimum)))
+
+    def _set_active_from_position(self, pos_x: float):
+        value = self._value_from_position(pos_x)
+        if self._active_handle == "lower":
+            self.setLowerValue(min(value, self._upper_value))
+        elif self._active_handle == "upper":
+            self.setUpperValue(max(value, self._lower_value))
+
+
+def set_spinbox_max_width_fraction(widget, fraction: float = 0.7) -> None:
+    hint_width = max(1, widget.sizeHint().width())
+    widget.setMaximumWidth(max(60, int(round(hint_width * float(fraction)))))
+
+
 class ProcessingWorker(QtCore.QObject):
     progress = QtCore.pyqtSignal(int, int, str)
     finished = QtCore.pyqtSignal(object)
@@ -163,6 +314,7 @@ class ProcessingWorker(QtCore.QObject):
 class VibeelsWindow(QtWidgets.QMainWindow):
     SETTINGS_GROUP = "paths"
     LAST_DATA_DIR_KEY = "last_data_dir"
+    TITLE_FONT_SIZE_KEY = "title_font_size"
 
     def __init__(self):
         super().__init__()
@@ -188,6 +340,10 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.processing_thread: Optional[QtCore.QThread] = None
         self.processing_worker: Optional[ProcessingWorker] = None
         self._last_progress_message: Optional[str] = None
+        self._active_map_histogram_handle: Optional[str] = None
+        self._snapshot_intensity_min = 0.0
+        self._snapshot_intensity_max = 1.0
+        self._active_snapshot_histogram_handle: Optional[str] = None
 
         self._build_ui()
         self._apply_default_ranges()
@@ -257,6 +413,32 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         axis.grid(False)
         return axis
 
+    def _current_title_font_size(self) -> int:
+        return int(self.title_font_size_combo.currentData()) if hasattr(self, "title_font_size_combo") else 10
+
+    def _apply_title_font_size_to_canvas(self, canvas) -> None:
+        size = self._current_title_font_size()
+        for axis in canvas.figure.axes:
+            axis.title.set_fontsize(size)
+        canvas.draw_idle()
+
+    def _on_title_font_size_changed(self, _index: int):
+        size = self._current_title_font_size()
+        rcParams["axes.titlesize"] = size
+        self.settings.setValue(f"{self.SETTINGS_GROUP}/{self.TITLE_FONT_SIZE_KEY}", size)
+        for canvas_name in [
+            "image_canvas",
+            "corrected_canvas",
+            "fit_canvas",
+            "spectrum_canvas",
+            "reference_image_canvas",
+            "map_hist_canvas",
+            "snapshot_hist_canvas",
+        ]:
+            canvas = getattr(self, canvas_name, None)
+            if canvas is not None:
+                self._apply_title_font_size_to_canvas(canvas)
+
     def _build_ui(self):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -322,11 +504,12 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 2)
 
         self._build_data_tab()
-        self._build_image_tab()
+        self._build_plot_tab()
         self._build_map_tab()
         self._build_spot_tab()
         self._build_calibration_tab()
         self._build_saved_maps_tab()
+        self._build_image_tab()
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def _build_data_tab(self):
@@ -337,8 +520,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.eels_path_label.setWordWrap(True)
 
         load_eels = self._make_button("Load EELS DM3/DM4", self._load_eels, variant="success")
-        refresh = self._make_button("Process Current Settings", self._process_current)
-        export_button = self._make_button("Export NPY", self._save_results)
+        refresh = self._make_button("Process Current Settings", self._process_current, variant="danger")
         save_state = self._make_button("Save status", self._save_session_state)
         load_state = self._make_button("Restore status", self._load_selected_session_state)
 
@@ -349,7 +531,6 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         layout.addRow("Loaded shape", self.shape_label)
         action_buttons = QtWidgets.QHBoxLayout()
         action_buttons.addWidget(refresh, 1)
-        action_buttons.addWidget(export_button, 1)
         layout.addRow(action_buttons)
         state_buttons = QtWidgets.QHBoxLayout()
         state_buttons.addWidget(save_state, 1)
@@ -381,22 +562,23 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.image_path_label = QtWidgets.QLabel("Optional image not loaded")
         self.image_path_label.setWordWrap(True)
 
-        self.reference_image_min_slider = QtWidgets.QSlider(QtOrientation.Horizontal)
-        self.reference_image_max_slider = QtWidgets.QSlider(QtOrientation.Horizontal)
-        for slider in [self.reference_image_min_slider, self.reference_image_max_slider]:
-            slider.setRange(0, 1000)
-            slider.valueChanged.connect(self._update_reference_image_preview)
+        self.reference_image_slider = RangeSlider(QtOrientation.Horizontal)
+        self.reference_image_slider.setRange(0, 1000)
+        self.reference_image_slider.valueChanged.connect(self._update_reference_image_preview)
         self.reference_image_min_label = QtWidgets.QLabel("Z min: -")
         self.reference_image_max_label = QtWidgets.QLabel("Z max: -")
         self._reference_image_min = 0.0
         self._reference_image_max = 1.0
 
+        reference_labels = QtWidgets.QHBoxLayout()
+        reference_labels.addWidget(self.reference_image_min_label)
+        reference_labels.addStretch(1)
+        reference_labels.addWidget(self.reference_image_max_label)
+
         controls.addRow(load_image)
         controls.addRow("Reference image", self.image_path_label)
-        controls.addRow(self.reference_image_min_label)
-        controls.addRow(self.reference_image_min_slider)
-        controls.addRow(self.reference_image_max_label)
-        controls.addRow(self.reference_image_max_slider)
+        controls.addRow(reference_labels)
+        controls.addRow(self.reference_image_slider)
         layout.addLayout(controls)
 
         self.reference_image_canvas = PlotCanvas((1, 1), self)
@@ -405,6 +587,44 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.reference_image_canvas, 1)
 
         self.tabs.addTab(tab, "Image")
+
+    def _build_plot_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QFormLayout(tab)
+
+        self.enable_selector = QtWidgets.QCheckBox("Enable mouse ROI editing")
+        self.enable_selector.setChecked(True)
+        self.enable_selector.toggled.connect(self._sync_selector_state)
+        self.normalize_saved_spectra_checkbox = QtWidgets.QCheckBox("Normalize spectra intensity")
+        self.normalize_saved_spectra_checkbox.toggled.connect(self._update_view_for_active_tab)
+        export_button = self._make_button("Export NPY", self._save_results)
+        self.title_font_size_combo = QtWidgets.QComboBox()
+        for size in range(8, 31, 2):
+            self.title_font_size_combo.addItem(str(size), size)
+        current_size = self.settings.value(
+            f"{self.SETTINGS_GROUP}/{self.TITLE_FONT_SIZE_KEY}",
+            10,
+            type=int,
+        )
+        current_index = self.title_font_size_combo.findData(int(current_size))
+        if current_index < 0:
+            current_index = self.title_font_size_combo.findData(10)
+        self.title_font_size_combo.setCurrentIndex(current_index)
+        self.title_font_size_combo.currentIndexChanged.connect(self._on_title_font_size_changed)
+        set_spinbox_max_width_fraction(self.title_font_size_combo, 0.25)
+
+        helper = QtWidgets.QLabel(
+            "Controls mouse-based polygon editing in 2D Map and extraction-band dragging in 1D Spot."
+        )
+        helper.setWordWrap(True)
+
+        layout.addRow(self.enable_selector)
+        layout.addRow(helper)
+        layout.addRow(self.normalize_saved_spectra_checkbox)
+        layout.addRow(export_button)
+        layout.addRow("Title font size", self.title_font_size_combo)
+
+        self.tabs.addTab(tab, "Plot")
 
     def _build_map_tab(self):
         self.energy_start_spin = QtWidgets.QSpinBox()
@@ -425,19 +645,29 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             widget.setMaximum(100000)
             widget.valueChanged.connect(self._update_selection_overlay)
 
-        self.enable_selector = QtWidgets.QCheckBox("Drag ROI / extraction band on image")
-        self.enable_selector.setChecked(True)
-        self.enable_selector.toggled.connect(self._sync_selector_state)
+        for widget in [
+            self.energy_start_spin,
+            self.energy_stop_spin,
+            self.roi_x0,
+            self.roi_x1,
+            self.roi_y0,
+            self.roi_y1,
+        ]:
+            set_spinbox_max_width_fraction(widget)
 
-        self.map_mask_min_slider = QtWidgets.QSlider(QtOrientation.Horizontal)
-        self.map_mask_max_slider = QtWidgets.QSlider(QtOrientation.Horizontal)
-        for slider in [self.map_mask_min_slider, self.map_mask_max_slider]:
-            slider.setRange(0, 1000)
-            slider.valueChanged.connect(self._on_map_mask_slider_changed)
+        self.map_mask_slider = RangeSlider(QtOrientation.Horizontal)
+        self.map_mask_slider.setRange(0, 1000)
+        self.map_mask_slider.valueChanged.connect(self._on_map_mask_slider_changed)
         self.map_mask_min_label = QtWidgets.QLabel("Mask min: -")
         self.map_mask_max_label = QtWidgets.QLabel("Mask max: -")
+        self.map_hist_log_checkbox = QtWidgets.QCheckBox("Log y")
+        self.map_hist_log_checkbox.setChecked(True)
+        self.map_hist_log_checkbox.toggled.connect(self._update_map_histogram)
         self.map_hist_canvas = PlotCanvas((1, 1), self)
-        self.map_hist_canvas.setMinimumHeight(180)
+        self.map_hist_canvas.setMinimumHeight(126)
+        self.map_hist_canvas.mpl_connect("button_press_event", self._on_map_histogram_press)
+        self.map_hist_canvas.mpl_connect("motion_notify_event", self._on_map_histogram_move)
+        self.map_hist_canvas.mpl_connect("button_release_event", self._on_map_histogram_release)
 
         process_button = self._make_button("Apply ROI / Alignment", self._process_current, variant="danger")
 
@@ -451,18 +681,17 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.roi_x1,
             self.roi_y0,
             self.roi_y1,
-            self.map_mask_min_slider,
-            self.map_mask_max_slider,
+            self.map_mask_slider,
             self.map_hist_canvas,
             self.map_mask_min_label,
             self.map_mask_max_label,
-            self.enable_selector,
+            self.map_hist_log_checkbox,
         ]
 
         map_grid = QtWidgets.QGridLayout()
-        map_grid.addWidget(QtWidgets.QLabel("Map energy start"), 0, 0)
+        map_grid.addWidget(QtWidgets.QLabel("Map-z pixel start"), 0, 0)
         map_grid.addWidget(self.energy_start_spin, 0, 1)
-        map_grid.addWidget(QtWidgets.QLabel("Map energy stop"), 0, 2)
+        map_grid.addWidget(QtWidgets.QLabel("Map-z pixel stop"), 0, 2)
         map_grid.addWidget(self.energy_stop_spin, 0, 3)
         map_grid.addWidget(QtWidgets.QLabel("ROI x start"), 1, 0)
         map_grid.addWidget(self.roi_x0, 1, 1)
@@ -476,12 +705,15 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         map_grid.setColumnStretch(1, 1)
         map_grid.setColumnStretch(2, 0)
         map_grid.setColumnStretch(3, 1)
+        mask_label_row = QtWidgets.QHBoxLayout()
+        mask_label_row.addWidget(self.map_mask_min_label)
+        mask_label_row.addStretch(1)
+        mask_label_row.addWidget(self.map_hist_log_checkbox)
+        mask_label_row.addStretch(1)
+        mask_label_row.addWidget(self.map_mask_max_label)
         layout.addRow(map_grid)
-        layout.addRow(self.enable_selector)
-        layout.addRow(self.map_mask_min_label)
-        layout.addRow(self.map_mask_min_slider)
-        layout.addRow(self.map_mask_max_label)
-        layout.addRow(self.map_mask_max_slider)
+        layout.addRow(mask_label_row)
+        layout.addRow(self.map_mask_slider)
         layout.addRow(self.map_hist_canvas)
         layout.addRow(process_button)
 
@@ -499,10 +731,25 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.snapshot_next_button = self._make_button("Next", self._show_next_snapshot)
         for widget in [self.stack_y0, self.stack_y1, self.frame_start, self.frame_stop]:
             widget.setMaximum(100000)
+        for widget in [self.stack_y0, self.stack_y1, self.frame_start, self.frame_stop, self.snapshot_index_spin]:
+            set_spinbox_max_width_fraction(widget)
         self.stack_y0.valueChanged.connect(self._update_selection_overlay)
         self.stack_y1.valueChanged.connect(self._update_selection_overlay)
         self.frame_start.valueChanged.connect(self._draw_initial_image)
         self.frame_stop.valueChanged.connect(self._draw_initial_image)
+        self.snapshot_z_slider = RangeSlider(QtOrientation.Horizontal)
+        self.snapshot_z_slider.setRange(0, 1000)
+        self.snapshot_z_slider.valueChanged.connect(self._on_snapshot_z_slider_changed)
+        self.snapshot_z_min_label = QtWidgets.QLabel("Z min: -")
+        self.snapshot_z_max_label = QtWidgets.QLabel("Z max: -")
+        self.snapshot_hist_log_checkbox = QtWidgets.QCheckBox("Log y")
+        self.snapshot_hist_log_checkbox.setChecked(True)
+        self.snapshot_hist_log_checkbox.toggled.connect(self._update_snapshot_histogram)
+        self.snapshot_hist_canvas = PlotCanvas((1, 1), self)
+        self.snapshot_hist_canvas.setMinimumHeight(126)
+        self.snapshot_hist_canvas.mpl_connect("button_press_event", self._on_snapshot_histogram_press)
+        self.snapshot_hist_canvas.mpl_connect("motion_notify_event", self._on_snapshot_histogram_move)
+        self.snapshot_hist_canvas.mpl_connect("button_release_event", self._on_snapshot_histogram_release)
 
         process_button = self._make_button("Apply ROI / Alignment", self._process_current, variant="danger")
 
@@ -517,6 +764,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self.snapshot_index_spin,
             self.snapshot_prev_button,
             self.snapshot_next_button,
+            self.snapshot_z_slider,
+            self.snapshot_hist_canvas,
+            self.snapshot_z_min_label,
+            self.snapshot_z_max_label,
+            self.snapshot_hist_log_checkbox,
         ]
 
         snapshot_nav_row = QtWidgets.QHBoxLayout()
@@ -536,8 +788,17 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         range_grid.setColumnStretch(1, 1)
         range_grid.setColumnStretch(2, 0)
         range_grid.setColumnStretch(3, 1)
+        snapshot_hist_labels = QtWidgets.QHBoxLayout()
+        snapshot_hist_labels.addWidget(self.snapshot_z_min_label)
+        snapshot_hist_labels.addStretch(1)
+        snapshot_hist_labels.addWidget(self.snapshot_hist_log_checkbox)
+        snapshot_hist_labels.addStretch(1)
+        snapshot_hist_labels.addWidget(self.snapshot_z_max_label)
         layout.addRow("Snapshot index", snapshot_nav_row)
         layout.addRow(range_grid)
+        layout.addRow(snapshot_hist_labels)
+        layout.addRow(self.snapshot_z_slider)
+        layout.addRow(self.snapshot_hist_canvas)
         layout.addRow(process_button)
 
         self.spot_tab_index = self.tabs.addTab(tab, "1D Spot")
@@ -560,6 +821,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             widget.setDecimals(4)
             widget.setSingleStep(0.001)
             widget.setValue(value)
+            set_spinbox_max_width_fraction(widget)
 
         self.zlp_center_label = QtWidgets.QLabel("-")
         self.pixel_count_label = QtWidgets.QLabel("-")
@@ -595,12 +857,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.saved_update_plot_button = self._make_button("Update plot", self._update_view_for_active_tab)
         self.saved_add_current_button = self._make_button("Add current", self._add_current_entry)
         self.saved_remove_selected_button = self._make_button("Remove selected", self._remove_selected_saved_entries)
-        self.normalize_saved_spectra_checkbox = QtWidgets.QCheckBox("Normalize spectra intensity")
-        self.normalize_saved_spectra_checkbox.toggled.connect(self._update_view_for_active_tab)
         controls.addWidget(self.saved_update_plot_button)
         controls.addWidget(self.saved_add_current_button)
         controls.addWidget(self.saved_remove_selected_button)
-        controls.addWidget(self.normalize_saved_spectra_checkbox)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -663,7 +922,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
     def _on_processing_finished(self, result):
         self.current_result = result
-        self._render_result(result)
+        self._update_view_for_active_tab()
         self._set_progress(100, 100, "Processing complete")
         self._last_progress_message = None
         self._log("Processing complete.")
@@ -820,19 +1079,14 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         else:
             self._reference_image_min = float(np.nanmin(image))
             self._reference_image_max = float(np.nanmax(image))
-        self.reference_image_min_slider.blockSignals(True)
-        self.reference_image_max_slider.blockSignals(True)
-        self.reference_image_min_slider.setValue(0)
-        self.reference_image_max_slider.setValue(1000)
-        self.reference_image_min_slider.blockSignals(False)
-        self.reference_image_max_slider.blockSignals(False)
+        self.reference_image_slider.blockSignals(True)
+        self.reference_image_slider.setValues(0, 1000)
+        self.reference_image_slider.blockSignals(False)
         self._update_reference_image_preview()
 
     def _reference_image_range_values(self) -> tuple[float, float]:
-        min_pos = self.reference_image_min_slider.value()
-        max_pos = self.reference_image_max_slider.value()
-        if min_pos > max_pos:
-            min_pos, max_pos = max_pos, min_pos
+        min_pos = self.reference_image_slider.lowerValue()
+        max_pos = self.reference_image_slider.upperValue()
         span = self._reference_image_max - self._reference_image_min
         if span <= 0:
             return self._reference_image_min, self._reference_image_max
@@ -1043,7 +1297,10 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             "eels_path": self.loaded.eels_path if self.loaded else "",
             "image_path": self.loaded.image_path if self.loaded else "",
             "energy_range": [self.energy_start_spin.value(), self.energy_stop_spin.value()],
-            "map_mask_slider": [self.map_mask_min_slider.value(), self.map_mask_max_slider.value()],
+            "map_mask_slider": [self.map_mask_slider.lowerValue(), self.map_mask_slider.upperValue()],
+            "map_hist_log": self.map_hist_log_checkbox.isChecked(),
+            "snapshot_z_slider": [self.snapshot_z_slider.lowerValue(), self.snapshot_z_slider.upperValue()],
+            "snapshot_hist_log": self.snapshot_hist_log_checkbox.isChecked(),
             "snapshot_vertical_range": [self.stack_y0.value(), self.stack_y1.value()],
             "snapshot_frame_range": [self.frame_start.value(), self.frame_stop.value()],
             "snapshot_index": self.snapshot_index_spin.value(),
@@ -1051,6 +1308,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             "guess_window": [self.guess_start_spin.value(), self.guess_stop_spin.value()],
             "map_polygon_vertices": self.map_polygon_vertices or [],
             "normalize_saved_spectra": self.normalize_saved_spectra_checkbox.isChecked(),
+            "title_font_size": int(self.title_font_size_combo.currentData()),
         }
 
     def _build_state_repro_script(self) -> str:
@@ -1204,24 +1462,32 @@ plt.show()
         self._log(f"Saved session state to {state_dir}")
 
     def _load_eels_from_path(self, path: str) -> object:
-        signal = load_signal(path)
+        signal = load_eels_signal(path)
         image_signal = self.loaded.image_signal if self.loaded else None
         image_path = self.loaded.image_path if self.loaded else None
         self.loaded = LoadedData(signal, image_signal, path, image_path)
+        self.current_result = None
+        self.saved_map_entries = []
         self._image_view_limits = None
         self._corrected_view_limits = None
         self.map_polygon_vertices = None
         self.eels_path_label.setText(path)
         self.shape_label.setText(str(signal.data.shape))
+        self.zlp_center_label.setText("-")
+        self.pixel_count_label.setText("-")
+        self.axis_span_label.setText("-")
         self._set_mode_from_signal(signal)
+        self._reset_analysis_canvases(self._current_mode_index())
         self._sync_ranges_to_loaded_data()
         self._update_mode_specific_ui()
+        self._refresh_saved_map_table()
         if self._current_mode_index() == 0:
             self._reset_map_histogram_controls()
         self._remember_data_dir(path)
         if image_signal is None:
             self._update_reference_image_preview()
         self._refresh_saved_state_records()
+        self._update_snapshot_histogram()
         return signal
 
     def _load_image_from_path(self, path: str):
@@ -1286,12 +1552,25 @@ plt.show()
             polygon_vertices = metadata.get("map_polygon_vertices", [])
             self.map_polygon_vertices = [(float(x), float(y)) for x, y in polygon_vertices] if polygon_vertices else None
 
-            slider_values = metadata.get("map_mask_slider", [self.map_mask_min_slider.value(), self.map_mask_max_slider.value()])
+            slider_values = metadata.get(
+                "map_mask_slider",
+                [self.map_mask_slider.lowerValue(), self.map_mask_slider.upperValue()],
+            )
             self._draw_initial_image()
-            self.map_mask_min_slider.setValue(int(slider_values[0]))
-            self.map_mask_max_slider.setValue(int(slider_values[1]))
+            self.map_mask_slider.setValues(int(slider_values[0]), int(slider_values[1]))
+            self.map_hist_log_checkbox.setChecked(bool(metadata.get("map_hist_log", True)))
+            snapshot_slider_values = metadata.get(
+                "snapshot_z_slider",
+                [self.snapshot_z_slider.lowerValue(), self.snapshot_z_slider.upperValue()],
+            )
+            self.snapshot_z_slider.setValues(int(snapshot_slider_values[0]), int(snapshot_slider_values[1]))
+            self.snapshot_hist_log_checkbox.setChecked(bool(metadata.get("snapshot_hist_log", True)))
 
             self.normalize_saved_spectra_checkbox.setChecked(bool(metadata.get("normalize_saved_spectra", False)))
+            title_font_size = int(metadata.get("title_font_size", self.title_font_size_combo.currentData()))
+            title_index = self.title_font_size_combo.findData(title_font_size)
+            if title_index >= 0:
+                self.title_font_size_combo.setCurrentIndex(title_index)
             self.saved_map_entries = self._deserialize_saved_map_entries(
                 list(metadata.get("saved_map_entries", [])),
                 arrays,
@@ -1424,7 +1703,7 @@ plt.show()
         self.saved_map_entries.append(entry)
         self._refresh_saved_map_table()
         self._log(f"Added saved spectrum #{len(self.saved_map_entries)}.")
-        self._draw_initial_image()
+        self._update_view_for_active_tab()
 
     def _update_saved_spectra_plot(self):
         spectrum_ax = self.spectrum_canvas.reset_axis()
@@ -1463,6 +1742,16 @@ plt.show()
         spectrum_ax.legend(loc="best", fontsize=8)
         self.spectrum_canvas.draw_idle()
 
+    def _has_visible_saved_entries(self) -> bool:
+        return bool(self._saved_map_entries_for_display())
+
+    def _visible_saved_preview_entries(self) -> list[tuple[int, SavedMapEntry]]:
+        entries = self._saved_map_entries_for_display()
+        if not entries:
+            return []
+        preview_mode = entries[0][1].mode
+        return [(row, entry) for row, entry in entries if entry.mode == preview_mode]
+
     def _clear_saved_maps_preview(self):
         image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
         image_ax.text(0.5, 0.5, "No saved entries selected for display", ha="center", va="center")
@@ -1484,13 +1773,49 @@ plt.show()
         spectrum_ax.set_axis_off()
         self.spectrum_canvas.draw_idle()
 
+    def _reset_analysis_canvases(self, mode_index: Optional[int] = None):
+        if mode_index is None:
+            mode_index = self._current_mode_index() if self.loaded is not None else 0
+
+        self._detach_selector()
+        self.selection_rect = None
+        self.selection_polygon = None
+        self._image_view_limits = None
+        self._corrected_view_limits = None
+
+        if mode_index == 0:
+            image_message = "Map intensity preview will appear here"
+            corrected_message = "Masked map image will appear here after processing"
+        else:
+            image_message = "Snapshot preview will appear here"
+            corrected_message = "Aligned snapshot image will appear here after processing"
+
+        image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
+        image_ax.text(0.5, 0.5, image_message, ha="center", va="center")
+        image_ax.set_axis_off()
+        self.image_canvas.draw_idle()
+
+        corrected_ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
+        corrected_ax.text(0.5, 0.5, corrected_message, ha="center", va="center")
+        corrected_ax.set_axis_off()
+        self.corrected_canvas.draw_idle()
+
+        fit_ax = self.fit_canvas.reset_axis()
+        fit_ax.text(0.5, 0.5, "Zero-loss fit preview will appear here after processing", ha="center", va="center")
+        fit_ax.set_axis_off()
+        self.fit_canvas.draw_idle()
+
+        spectrum_ax = self.spectrum_canvas.reset_axis()
+        spectrum_ax.text(0.5, 0.5, "Summed spectrum will appear here after processing", ha="center", va="center")
+        spectrum_ax.set_axis_off()
+        self.spectrum_canvas.draw_idle()
+
     def _preview_selected_saved_maps(self):
-        entries = self._saved_map_entries_for_display()
-        if not entries:
+        preview_entries = self._visible_saved_preview_entries()
+        if not preview_entries:
             self._clear_saved_maps_preview()
             return
-        preview_mode = entries[0][1].mode
-        preview_entries = [(row, entry) for row, entry in entries if entry.mode == preview_mode]
+        preview_mode = preview_entries[0][1].mode
 
         self._detach_selector()
         image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
@@ -1574,7 +1899,7 @@ plt.show()
         self._update_saved_spectra_plot()
 
     def _update_view_for_active_tab(self):
-        if self._saved_maps_tab_active():
+        if self._has_visible_saved_entries():
             self._preview_selected_saved_maps()
             return
         if self.current_result is not None:
@@ -1612,7 +1937,7 @@ plt.show()
         except Exception as exc:
             self._log(f"Failed to load EELS file: {exc}")
             return
-        self._draw_initial_image()
+        self._update_view_for_active_tab()
         self._log(f"Loaded EELS signal: {path}")
 
     def _load_image(self):
@@ -1629,7 +1954,7 @@ plt.show()
         except Exception as exc:
             self._log(f"Failed to load image file: {exc}")
             return
-        self._draw_initial_image()
+        self._update_view_for_active_tab()
         self._log(f"Loaded reference image: {path}")
 
     def _sync_ranges_to_loaded_data(self):
@@ -1658,9 +1983,17 @@ plt.show()
             self.frame_stop.setValue(shape[0])
             self.snapshot_index_spin.setMaximum(shape[0] - 1)
             self.snapshot_index_spin.setValue(min(self.snapshot_index_spin.value(), shape[0] - 1))
+            self._reset_snapshot_histogram_controls()
         self._update_snapshot_navigation_enabled()
 
     def _detect_mode_index(self, signal) -> int:
+        data = getattr(signal, "data", None)
+        if data is None or np.asarray(data).ndim != 3:
+            raise ValueError(
+                "Unsupported EELS dataset: expected a 3D Signal1D map `(y, x, energy)` or "
+                "3D Signal2D snapshot stack `(frame, y, energy)`. "
+                f"Got {describe_signal_layout(signal)}."
+            )
         class_name = signal.__class__.__name__
         if class_name == "Signal2D":
             return 1
@@ -1731,16 +2064,21 @@ plt.show()
         return mask
 
     def _map_intensity_range_values(self) -> tuple[float, float]:
-        min_pos = self.map_mask_min_slider.value()
-        max_pos = self.map_mask_max_slider.value()
-        if min_pos > max_pos:
-            min_pos, max_pos = max_pos, min_pos
+        min_pos = self.map_mask_slider.lowerValue()
+        max_pos = self.map_mask_slider.upperValue()
         span = self._map_intensity_max - self._map_intensity_min
         if span <= 0:
             return self._map_intensity_min, self._map_intensity_max
         z_min = self._map_intensity_min + (span * min_pos / 1000.0)
         z_max = self._map_intensity_min + (span * max_pos / 1000.0)
         return z_min, z_max
+
+    def _map_mask_slider_value_from_intensity(self, intensity: float) -> int:
+        span = self._map_intensity_max - self._map_intensity_min
+        if span <= 0:
+            return 0
+        clamped = min(max(float(intensity), self._map_intensity_min), self._map_intensity_max)
+        return int(round((clamped - self._map_intensity_min) / span * 1000.0))
 
     def _set_map_mask_slider_values(self, z_min: float, z_max: float):
         span = self._map_intensity_max - self._map_intensity_min
@@ -1752,12 +2090,140 @@ plt.show()
             clamped_max = min(max(z_max, self._map_intensity_min), self._map_intensity_max)
             min_pos = int(round((clamped_min - self._map_intensity_min) / span * 1000.0))
             max_pos = int(round((clamped_max - self._map_intensity_min) / span * 1000.0))
-        self.map_mask_min_slider.blockSignals(True)
-        self.map_mask_max_slider.blockSignals(True)
-        self.map_mask_min_slider.setValue(min_pos)
-        self.map_mask_max_slider.setValue(max_pos)
-        self.map_mask_min_slider.blockSignals(False)
-        self.map_mask_max_slider.blockSignals(False)
+        self.map_mask_slider.blockSignals(True)
+        self.map_mask_slider.setValues(min_pos, max_pos)
+        self.map_mask_slider.blockSignals(False)
+
+    def _map_image_display_limits(self) -> tuple[Optional[float], Optional[float]]:
+        if self._current_mode_index() != 0:
+            return None, None
+        return self._map_intensity_range_values()
+
+    def _current_snapshot_display_image(self) -> Optional[np.ndarray]:
+        if self.loaded is None or self._current_mode_index() != 1:
+            return None
+        data = np.asarray(self.loaded.eels_signal.data)
+        if data.ndim != 3 or data.shape[0] == 0:
+            return None
+        frame_index = min(self.snapshot_index_spin.value(), data.shape[0] - 1)
+        frame_index = max(0, frame_index)
+        return np.asarray(data[frame_index], dtype=float)
+
+    def _snapshot_intensity_range_values(self) -> tuple[float, float]:
+        min_pos = self.snapshot_z_slider.lowerValue()
+        max_pos = self.snapshot_z_slider.upperValue()
+        span = self._snapshot_intensity_max - self._snapshot_intensity_min
+        if span <= 0:
+            return self._snapshot_intensity_min, self._snapshot_intensity_max
+        z_min = self._snapshot_intensity_min + (span * min_pos / 1000.0)
+        z_max = self._snapshot_intensity_min + (span * max_pos / 1000.0)
+        return z_min, z_max
+
+    def _snapshot_z_slider_value_from_intensity(self, intensity: float) -> int:
+        span = self._snapshot_intensity_max - self._snapshot_intensity_min
+        if span <= 0:
+            return 0
+        clamped = min(max(float(intensity), self._snapshot_intensity_min), self._snapshot_intensity_max)
+        return int(round((clamped - self._snapshot_intensity_min) / span * 1000.0))
+
+    def _set_snapshot_z_slider_values(self, z_min: float, z_max: float):
+        span = self._snapshot_intensity_max - self._snapshot_intensity_min
+        if span <= 0:
+            min_pos = 0
+            max_pos = 1000
+        else:
+            clamped_min = min(max(z_min, self._snapshot_intensity_min), self._snapshot_intensity_max)
+            clamped_max = min(max(z_max, self._snapshot_intensity_min), self._snapshot_intensity_max)
+            min_pos = int(round((clamped_min - self._snapshot_intensity_min) / span * 1000.0))
+            max_pos = int(round((clamped_max - self._snapshot_intensity_min) / span * 1000.0))
+        self.snapshot_z_slider.blockSignals(True)
+        self.snapshot_z_slider.setValues(min_pos, max_pos)
+        self.snapshot_z_slider.blockSignals(False)
+
+    def _snapshot_image_display_limits(self) -> tuple[Optional[float], Optional[float]]:
+        if self._current_mode_index() != 1:
+            return None, None
+        return self._snapshot_intensity_range_values()
+
+    def _reset_snapshot_histogram_controls(self, preserve_range: bool = False):
+        image = self._current_snapshot_display_image()
+        if image is None or image.size == 0:
+            return
+        previous_min, previous_max = self._snapshot_intensity_range_values()
+        self._snapshot_intensity_min = float(np.min(image))
+        self._snapshot_intensity_max = float(np.max(image))
+        if preserve_range:
+            self._set_snapshot_z_slider_values(previous_min, previous_max)
+        else:
+            self._set_snapshot_z_slider_values(self._snapshot_intensity_min, self._snapshot_intensity_max)
+        self._update_snapshot_histogram()
+
+    def _update_snapshot_histogram(self):
+        ax = self.snapshot_hist_canvas.reset_axis()
+        image = self._current_snapshot_display_image()
+        if image is None or image.size == 0:
+            ax.text(0.5, 0.5, "Load a snapshot stack to inspect intensity histogram", ha="center", va="center")
+            ax.set_axis_off()
+            self.snapshot_z_min_label.setText("Z min: -")
+            self.snapshot_z_max_label.setText("Z max: -")
+            self.snapshot_hist_canvas.draw_idle()
+            return
+        ax.hist(
+            np.ravel(image),
+            bins=64,
+            color=PLOT_MAIN,
+            edgecolor=SPINE,
+            log=self.snapshot_hist_log_checkbox.isChecked(),
+        )
+        z_min, z_max = self._snapshot_intensity_range_values()
+        ax.axvline(z_min, color=PLOT_PREVIEW, linewidth=1.2)
+        ax.axvline(z_max, color=PLOT_FIT, linewidth=1.2)
+        ax.set_title("Snapshot intensity histogram")
+        ax.set_xlabel("Detector intensity")
+        ax.set_ylabel("Pixels")
+        self.snapshot_z_min_label.setText(f"Z min: {z_min:.2f}")
+        self.snapshot_z_max_label.setText(f"Z max: {z_max:.2f}")
+        self.snapshot_hist_canvas.draw_idle()
+
+    def _snapshot_histogram_handle_at(self, x_value: Optional[float]) -> Optional[str]:
+        if x_value is None:
+            return None
+        z_min, z_max = self._snapshot_intensity_range_values()
+        axis_span = self._snapshot_intensity_max - self._snapshot_intensity_min
+        tolerance = max(axis_span * 0.03, 1e-12)
+        if abs(float(x_value) - z_min) <= abs(float(x_value) - z_max):
+            return "min" if abs(float(x_value) - z_min) <= tolerance else None
+        return "max" if abs(float(x_value) - z_max) <= tolerance else None
+
+    def _set_snapshot_histogram_handle_from_x(self, handle: str, x_value: Optional[float]):
+        if x_value is None:
+            return
+        slider_value = self._snapshot_z_slider_value_from_intensity(float(x_value))
+        if handle == "min":
+            self.snapshot_z_slider.setLowerValue(min(slider_value, self.snapshot_z_slider.upperValue()))
+        elif handle == "max":
+            self.snapshot_z_slider.setUpperValue(max(slider_value, self.snapshot_z_slider.lowerValue()))
+
+    def _on_snapshot_histogram_press(self, event):
+        if event.inaxes is None or event.inaxes not in self.snapshot_hist_canvas.figure.axes:
+            return
+        if event.button != 1:
+            return
+        handle = self._snapshot_histogram_handle_at(event.xdata)
+        if handle is None:
+            return
+        self._active_snapshot_histogram_handle = handle
+        self._set_snapshot_histogram_handle_from_x(handle, event.xdata)
+
+    def _on_snapshot_histogram_move(self, event):
+        if self._active_snapshot_histogram_handle is None:
+            return
+        if event.inaxes is None or event.inaxes not in self.snapshot_hist_canvas.figure.axes:
+            return
+        self._set_snapshot_histogram_handle_from_x(self._active_snapshot_histogram_handle, event.xdata)
+
+    def _on_snapshot_histogram_release(self, _event):
+        self._active_snapshot_histogram_handle = None
 
     def _reset_map_histogram_controls(self, preserve_mask_range: bool = False):
         image = self._map_intensity_image()
@@ -1784,7 +2250,13 @@ plt.show()
             self.map_hist_canvas.draw_idle()
             return
         values = image[polygon_mask]
-        ax.hist(values, bins=64, color=PLOT_MAIN, edgecolor=SPINE)
+        ax.hist(
+            values,
+            bins=64,
+            color=PLOT_MAIN,
+            edgecolor=SPINE,
+            log=self.map_hist_log_checkbox.isChecked(),
+        )
         z_min, z_max = self._map_intensity_range_values()
         ax.axvline(z_min, color=PLOT_PREVIEW, linewidth=1.2)
         ax.axvline(z_max, color=PLOT_FIT, linewidth=1.2)
@@ -1795,9 +2267,50 @@ plt.show()
         self.map_mask_max_label.setText(f"Mask max: {z_max:.2f}")
         self.map_hist_canvas.draw_idle()
 
-    def _on_map_mask_slider_changed(self):
+    def _map_histogram_handle_at(self, x_value: Optional[float]) -> Optional[str]:
+        if x_value is None:
+            return None
+        z_min, z_max = self._map_intensity_range_values()
+        axis_span = self._map_intensity_max - self._map_intensity_min
+        tolerance = max(axis_span * 0.03, 1e-12)
+        if abs(float(x_value) - z_min) <= abs(float(x_value) - z_max):
+            return "min" if abs(float(x_value) - z_min) <= tolerance else None
+        return "max" if abs(float(x_value) - z_max) <= tolerance else None
+
+    def _set_map_histogram_handle_from_x(self, handle: str, x_value: Optional[float]):
+        if x_value is None:
+            return
+        slider_value = self._map_mask_slider_value_from_intensity(float(x_value))
+        if handle == "min":
+            self.map_mask_slider.setLowerValue(min(slider_value, self.map_mask_slider.upperValue()))
+        elif handle == "max":
+            self.map_mask_slider.setUpperValue(max(slider_value, self.map_mask_slider.lowerValue()))
+
+    def _on_map_histogram_press(self, event):
+        if event.inaxes is None or event.inaxes not in self.map_hist_canvas.figure.axes:
+            return
+        if event.button != 1:
+            return
+        handle = self._map_histogram_handle_at(event.xdata)
+        if handle is None:
+            return
+        self._active_map_histogram_handle = handle
+        self._set_map_histogram_handle_from_x(handle, event.xdata)
+
+    def _on_map_histogram_move(self, event):
+        if self._active_map_histogram_handle is None:
+            return
+        if event.inaxes is None or event.inaxes not in self.map_hist_canvas.figure.axes:
+            return
+        self._set_map_histogram_handle_from_x(self._active_map_histogram_handle, event.xdata)
+
+    def _on_map_histogram_release(self, _event):
+        self._active_map_histogram_handle = None
+
+    def _on_map_mask_slider_changed(self, *_args):
         self._update_map_histogram()
         if self._current_mode_index() == 0:
+            self._update_view_for_active_tab()
             self._update_map_mask_preview()
 
     def _update_map_mask_preview(self):
@@ -1814,7 +2327,7 @@ plt.show()
         z_min, z_max = self._map_intensity_range_values()
         selection_mask = polygon_mask & (image >= z_min) & (image <= z_max)
         masked = np.ma.masked_where(~selection_mask, image)
-        ax.imshow(masked, cmap="inferno", origin="upper")
+        ax.imshow(masked, cmap="inferno", origin="upper", vmin=z_min, vmax=z_max)
         ax.set_title("Masked image")
         ax.set_xlabel("")
         ax.set_ylabel("")
@@ -1835,8 +2348,18 @@ plt.show()
                 pass
         self.selector = None
 
+    def _clear_corrected_preview(self, message: str):
+        ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
+        ax.text(0.5, 0.5, message, ha="center", va="center")
+        ax.set_axis_off()
+        self.corrected_canvas.draw_idle()
+
     def _draw_initial_image(self):
-        preserve_view = self.loaded is not None and self._current_mode_index() == 1
+        preserve_view = (
+            self.loaded is not None
+            and self._current_mode_index() == 1
+            and self._image_view_limits is not None
+        )
         if preserve_view and self.image_canvas.figure.axes:
             current_ax = self.image_canvas.figure.axes[0]
             self._image_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
@@ -1847,13 +2370,15 @@ plt.show()
             ax.text(0.5, 0.5, "Load an EELS dataset to start", ha="center", va="center")
             ax.set_axis_off()
             self.image_canvas.draw_idle()
+            self._clear_corrected_preview("Load data and run alignment to preview corrected output")
             return
 
         mode_index = self._current_mode_index()
         data = np.asarray(self.loaded.eels_signal.data)
         if mode_index == 0:
             image = self._map_intensity_image()
-            im = ax.imshow(image, cmap="inferno", origin="upper")
+            z_min, z_max = self._map_image_display_limits()
+            im = ax.imshow(image, cmap="inferno", origin="upper", vmin=z_min, vmax=z_max)
             ax.set_title("Map intensity preview")
             ax.set_xlabel("")
             ax.set_ylabel("")
@@ -1864,7 +2389,8 @@ plt.show()
         else:
             frame_index = min(self.snapshot_index_spin.value(), data.shape[0] - 1)
             detector_image = data[frame_index]
-            ax.imshow(detector_image, cmap="viridis", origin="upper", aspect="auto")
+            z_min, z_max = self._snapshot_image_display_limits()
+            ax.imshow(detector_image, cmap="viridis", origin="upper", aspect="auto", vmin=z_min, vmax=z_max)
             ax.set_title(f"Snapshot {frame_index}")
             ax.set_xlabel("")
             ax.set_ylabel("")
@@ -1882,6 +2408,9 @@ plt.show()
         self._update_selection_overlay()
         if mode_index == 0:
             self._update_map_mask_preview()
+        else:
+            self._clear_corrected_preview("Run alignment to preview the corrected snapshot")
+            self._update_snapshot_histogram()
 
     def _attach_selector(self):
         axes = self.image_canvas.figure.axes
@@ -2150,7 +2679,7 @@ bundle_dir = Path(__file__).resolve().parent
 stem = "{data_stem}"
 arrays = np.load(bundle_dir / f"{{stem}}_graph_data.npz")
 params = json.loads((bundle_dir / f"{{stem}}.json").read_text())
-spectrum_xy = np.loadtxt(bundle_dir / f"{{stem}}.xy", skiprows=1)
+spectrum_vxy = np.loadtxt(bundle_dir / f"{{stem}}.vxy", skiprows=1)
 
 def curve_fwhm(x_values, y_values):
     x_values = np.asarray(x_values, dtype=float)
@@ -2207,13 +2736,13 @@ if "zlp_snapshot_x" in arrays and arrays["zlp_snapshot_x"].size:
         linewidth=1.0,
         label=f"snapshot {{snap_index}} (scaled x{{scale:.2f}})",
     )
-ax2.set_title(f"ZLP, aligned (FWHM = {format_scientific(curve_fwhm(arrays['zlp_x'], arrays['zlp_fit']))} eV)")
+ax2.set_title(f"ZLP, aligned (FWHM = {{format_scientific(curve_fwhm(arrays['zlp_x'], arrays['zlp_fit']))}} eV)")
 ax2.set_xlabel("Energy loss (eV)")
 ax2.set_ylabel("ZLP region")
 ax2.legend(loc="lower left", fontsize=8)
 
 ax3 = fig.add_subplot(gs[1, :])
-ax3.plot(spectrum_xy[:, 0], spectrum_xy[:, 1], color="#f2f2f2", linewidth=1.0)
+ax3.plot(spectrum_vxy[:, 0], spectrum_vxy[:, 2], color="#f2f2f2", linewidth=1.0)
 ax3.set_xlabel("Energy loss (eV, ZLP corrected)")
 ax3.set_ylabel("Intensity (a.u.)")
 sec = ax3.secondary_xaxis("top", functions=(lambda x: x * 8065.54429, lambda x: x / 8065.54429))
@@ -2221,6 +2750,178 @@ sec.set_xlabel(r"Wavenumber (cm$^{{-1}}$)")
 
 plt.show()
 '''
+
+    def _build_export_vxy(self, energy_axis_ev: np.ndarray, intensity: np.ndarray) -> np.ndarray:
+        energy_axis_ev = np.asarray(energy_axis_ev, dtype=float)
+        intensity = np.asarray(intensity, dtype=float)
+        return np.column_stack([energy_axis_ev, energy_axis_ev * EV_TO_CMINV, intensity])
+
+    def _write_saved_export_vxy_files(self, export_dir: Path, data_stem: str):
+        for index, entry in enumerate(self.saved_map_entries):
+            spectrum_vxy = self._build_export_vxy(entry.energy_axis, entry.spectrum)
+            np.savetxt(
+                export_dir / f"{data_stem}_saved_{index}.vxy",
+                spectrum_vxy,
+                header="eV cm-1 y",
+                comments="",
+            )
+
+    def _build_export_figure(self, arrays: dict[str, np.ndarray], spectrum_vxy: np.ndarray) -> Figure:
+        fig = Figure(figsize=(14, 8), constrained_layout=True)
+        gs = fig.add_gridspec(2, 3)
+
+        ax0 = fig.add_subplot(gs[0, 0])
+        ax1 = fig.add_subplot(gs[0, 1])
+        ax2 = fig.add_subplot(gs[0, 2])
+        ax3 = fig.add_subplot(gs[1, :])
+        style_mpl_axes(fig, ax0, ax1, ax2, ax3)
+
+        preview_entries = self._visible_saved_preview_entries()
+        if preview_entries:
+            preview_mode = preview_entries[0][1].mode
+            base_image = np.asarray(preview_entries[0][1].display_image, dtype=float)
+            ax0.imshow(base_image, cmap="inferno" if preview_mode == "map" else "viridis", origin="upper", aspect="auto")
+            ax0.set_title("ROI")
+            ax0.set_xlabel("")
+            ax0.set_ylabel("")
+            for row, entry in preview_entries:
+                color = self._saved_map_entry_color(row)
+                if entry.polygon_vertices:
+                    ax0.add_patch(
+                        Polygon(
+                            entry.polygon_vertices,
+                            closed=True,
+                            fill=False,
+                            edgecolor=color,
+                            linewidth=1.8,
+                        )
+                    )
+
+            base_masked = self._saved_entry_masked_image_for_display(preview_entries[0][1])
+            combined_masked = np.full_like(base_masked, np.nan, dtype=float)
+            for _, entry in preview_entries:
+                entry_masked = self._saved_entry_masked_image_for_display(entry)
+                if entry_masked.shape != combined_masked.shape:
+                    continue
+                combined_masked = np.where(np.isfinite(entry_masked), entry_masked, combined_masked)
+            masked = np.ma.masked_invalid(combined_masked)
+            ax1.imshow(masked, cmap="inferno" if preview_mode == "map" else "viridis", origin="upper", aspect="auto")
+            ax1.set_title("Masked ROI")
+            ax1.set_xlabel("")
+            ax1.set_ylabel("")
+
+            active_entry = preview_entries[0][1]
+            active_fit_mask = (
+                (active_entry.energy_axis_raw >= active_entry.fit_window[0])
+                & (active_entry.energy_axis_raw <= active_entry.fit_window[1])
+            )
+            active_spectra_stack = np.asarray(active_entry.selected_spectra, dtype=float)
+            if active_spectra_stack.ndim == 1:
+                active_spectra_stack = active_spectra_stack[np.newaxis, :]
+            active_zlp_profile = np.sum(active_spectra_stack[:, active_fit_mask], axis=0)
+            for row, entry in preview_entries:
+                fit_mask = (
+                    (entry.energy_axis_raw >= entry.fit_window[0])
+                    & (entry.energy_axis_raw <= entry.fit_window[1])
+                )
+                spectra_stack = np.asarray(entry.selected_spectra, dtype=float)
+                if spectra_stack.ndim == 1:
+                    spectra_stack = spectra_stack[np.newaxis, :]
+                for index, spectrum in enumerate(spectra_stack[:, fit_mask]):
+                    ax2.plot(
+                        entry.energy_axis_raw[fit_mask],
+                        spectrum,
+                        color=self._saved_map_entry_color(row),
+                        alpha=0.15,
+                        linewidth=0.7,
+                        label=(entry.comment.strip() or f"Map {row + 1}") if index == 0 else None,
+                    )
+            ax2.axvline(
+                0.0,
+                color=PLOT_PREVIEW,
+                linewidth=1.0,
+                linestyle=":",
+                label="alignment target" if len(preview_entries) == 1 else "_nolegend_",
+            )
+            ax2.set_title(self._zlp_title(active_entry.energy_axis_raw[active_fit_mask], active_zlp_profile))
+            ax2.set_xlabel("Energy loss (eV)")
+            ax2.set_ylabel("Intensity")
+            ax2.legend(loc="best", fontsize=8)
+
+            normalize = self.normalize_saved_spectra_checkbox.isChecked()
+            for row, entry in preview_entries:
+                spectrum = self._scaled_saved_entry_spectrum(entry)
+                label = entry.comment.strip() or f"Map {row + 1}"
+                linewidth = 1.8 if entry.locked else 1.0
+                alpha = 1.0 if entry.locked else 0.85
+                ax3.plot(
+                    entry.energy_axis,
+                    spectrum,
+                    linewidth=linewidth,
+                    alpha=alpha,
+                    color=self._saved_map_entry_color(row),
+                    label=label,
+                )
+            ax3.set_xlabel("Energy loss (eV, ZLP corrected)")
+            ax3.set_ylabel("Normalized intensity" if normalize else "Intensity (a.u.)")
+            sec = ax3.secondary_xaxis("top", functions=(lambda x: x * EV_TO_CMINV, lambda x: x / EV_TO_CMINV))
+            sec.set_xlabel(r"Wavenumber (cm$^{-1}$)")
+            style_secondary_axis(sec)
+            ax3.legend(loc="best", fontsize=8)
+            return fig
+
+        if "detector_image_snapshot" in arrays:
+            ax0.imshow(arrays["detector_image_snapshot"], cmap="viridis", origin="upper", aspect="auto")
+            ax0.set_title(f"Snapshot {int(arrays['snapshot_index'][0])}")
+            ax0.set_xlabel("spectral channel")
+            ax0.set_ylabel("detector vertical")
+        else:
+            ax0.imshow(arrays["map_display_image"], cmap="gray", origin="upper")
+            ax0.contour(arrays["map_selection_mask"], levels=[0.5], colors=["cyan"], linewidths=1.0)
+            ax0.set_title("Map ROI")
+            ax0.set_xlabel("")
+            ax0.set_ylabel("")
+
+        if "detector_image_aligned_snapshot" in arrays and arrays["detector_image_aligned_snapshot"].size:
+            ax1.imshow(arrays["detector_image_aligned_snapshot"], cmap="viridis", origin="upper", aspect="auto")
+            ax1.set_title(f"Snapshot {int(arrays['snapshot_index'][0])} aligned")
+            ax1.set_xlabel("spectral channel")
+            ax1.set_ylabel("aligned detector rows")
+        elif "map_masked_image" in arrays:
+            masked = np.ma.masked_invalid(np.asarray(arrays["map_masked_image"], dtype=float))
+            ax1.imshow(masked, cmap="inferno", origin="upper")
+            ax1.set_title("Masked ROI")
+            ax1.set_xlabel("")
+            ax1.set_ylabel("")
+        else:
+            ax1.set_axis_off()
+
+        ax2.plot(arrays["zlp_x"], arrays["zlp_y_integrated"], ".", color="#f2f2f2", markersize=3, label="integrated")
+        ax2.plot(arrays["zlp_x"], arrays["zlp_fit"], color="#ff4d6d", linewidth=1.2, label="fit")
+        ax2.axvline(arrays["zlp_center_ev"][0], color="#3b82f6", linestyle="--", linewidth=1.0)
+        if "zlp_snapshot_x" in arrays and arrays["zlp_snapshot_x"].size:
+            scale = arrays["zlp_snapshot_scale"][0]
+            snap_index = int(arrays["snapshot_index"][0])
+            ax2.plot(
+                arrays["zlp_snapshot_x"],
+                arrays["zlp_snapshot_y_scaled"],
+                color="#f59e0b",
+                linewidth=1.0,
+                label=f"snapshot {snap_index} (scaled x{scale:.2f})",
+            )
+        ax2.set_title(self._zlp_title(arrays["zlp_x"], arrays["zlp_fit"], aligned=True))
+        ax2.set_xlabel("Energy loss (eV)")
+        ax2.set_ylabel("ZLP region")
+        ax2.legend(loc="lower left", fontsize=8)
+
+        ax3.plot(spectrum_vxy[:, 0], spectrum_vxy[:, 2], color="#f2f2f2", linewidth=1.0)
+        ax3.set_xlabel("Energy loss (eV, ZLP corrected)")
+        ax3.set_ylabel("Intensity (a.u.)")
+        sec = ax3.secondary_xaxis("top", functions=(lambda x: x * EV_TO_CMINV, lambda x: x / EV_TO_CMINV))
+        sec.set_xlabel(r"Wavenumber (cm$^{-1}$)")
+        style_secondary_axis(sec)
+
+        return fig
 
     def _save_results(self):
         if self.loaded is None or self.current_result is None:
@@ -2240,21 +2941,28 @@ plt.show()
         arrays = self._collect_export_arrays()
         params = self._collect_export_parameters()
 
-        xy_path = export_dir / f"{data_stem}.xy"
+        vxy_path = export_dir / f"{data_stem}.vxy"
         json_path = export_dir / f"{data_stem}.json"
         npz_path = export_dir / f"{data_stem}_graph_data.npz"
         script_path = export_dir / f"{data_stem}_reproduce.py"
+        pdf_path = export_dir / f"{data_stem}.pdf"
+        png_path = export_dir / f"{data_stem}.png"
 
-        spectrum_xy = np.column_stack(
-            [
-                np.asarray(self.current_result.energy_axis_calibrated, dtype=float),
-                np.asarray(self.current_result.summed_spectrum, dtype=float),
-            ]
+        spectrum_vxy = self._build_export_vxy(
+            self.current_result.energy_axis_calibrated,
+            self.current_result.summed_spectrum,
         )
-        np.savetxt(xy_path, spectrum_xy, header="x y", comments="")
+        np.savetxt(vxy_path, spectrum_vxy, header="eV cm-1 y", comments="")
         json_path.write_text(json.dumps(params, indent=2))
         np.savez(npz_path, **arrays)
         script_path.write_text(self._build_repro_script(data_stem))
+        self._write_saved_export_vxy_files(export_dir, data_stem)
+        export_figure = self._build_export_figure(arrays, spectrum_vxy)
+        try:
+            export_figure.savefig(pdf_path, dpi=300, bbox_inches="tight")
+            export_figure.savefig(png_path, dpi=300, bbox_inches="tight")
+        finally:
+            export_figure.clear()
 
         self._log(f"Saved results to {export_dir}")
         QtWidgets.QMessageBox.information(
@@ -2297,10 +3005,14 @@ plt.show()
         ax.set_ylim(y0, y1)
 
     def _on_snapshot_index_changed(self):
-        if self._current_mode_index() == 1 and isinstance(self.current_result, StackProcessingResult):
-            self._render_result(self.current_result)
-            return
-        self._draw_initial_image()
+        if self._current_mode_index() == 1:
+            self._reset_snapshot_histogram_controls(preserve_range=True)
+        self._update_view_for_active_tab()
+
+    def _on_snapshot_z_slider_changed(self, *_args):
+        self._update_snapshot_histogram()
+        if self._current_mode_index() == 1:
+            self._update_view_for_active_tab()
 
     def _current_snapshot_spectrum(self) -> Optional[np.ndarray]:
         if (
@@ -2383,7 +3095,8 @@ plt.show()
         image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
 
         if isinstance(result, MapProcessingResult):
-            im = image_ax.imshow(result.intensity_image, cmap="inferno", origin="upper")
+            z_min, z_max = self._map_image_display_limits()
+            im = image_ax.imshow(result.intensity_image, cmap="inferno", origin="upper", vmin=z_min, vmax=z_max)
             divider = make_axes_locatable(image_ax)
             cax = divider.append_axes("right", size="4%", pad=0.08)
             colorbar = self.image_canvas.figure.colorbar(im, cax=cax)
@@ -2396,7 +3109,8 @@ plt.show()
         else:
             frame_index = min(self.snapshot_index_spin.value(), self.loaded.eels_signal.data.shape[0] - 1)
             detector_image = self.loaded.eels_signal.data[frame_index]
-            image_ax.imshow(detector_image, cmap="viridis", origin="upper", aspect="auto")
+            z_min, z_max = self._snapshot_image_display_limits()
+            image_ax.imshow(detector_image, cmap="viridis", origin="upper", aspect="auto", vmin=z_min, vmax=z_max)
             band_height = max(1, self.stack_y1.value() - self.stack_y0.value())
             image_ax.add_patch(
                 Rectangle(
@@ -2429,7 +3143,8 @@ plt.show()
         if isinstance(result, StackProcessingResult):
             corrected_image = self._current_snapshot_aligned_image()
             if corrected_image is not None:
-                corrected_ax.imshow(corrected_image, cmap="viridis", origin="upper", aspect="auto")
+                z_min, z_max = self._snapshot_image_display_limits()
+                corrected_ax.imshow(corrected_image, cmap="viridis", origin="upper", aspect="auto", vmin=z_min, vmax=z_max)
                 corrected_ax.set_title(f"Snapshot {self.snapshot_index_spin.value()} aligned")
                 corrected_ax.set_xlabel("")
                 corrected_ax.set_ylabel("")
@@ -2444,8 +3159,9 @@ plt.show()
                 corrected_ax.set_axis_off()
         else:
             masked = np.ma.masked_invalid(result.masked_image)
-            corrected_ax.imshow(masked, cmap="inferno", origin="upper")
-            corrected_ax.set_title("Masked ROI")
+            z_min, z_max = self._map_image_display_limits()
+            corrected_ax.imshow(masked, cmap="inferno", origin="upper", vmin=z_min, vmax=z_max)
+            corrected_ax.set_title(f"No. spectra: {result.selected_pixel_count}")
             corrected_ax.set_xlabel("")
             corrected_ax.set_ylabel("")
         self.corrected_canvas.draw_idle()

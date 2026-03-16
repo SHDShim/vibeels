@@ -1,2 +1,3 @@
 - [x] It looks like alignment is not happening for the 2D map case.  Test this and fix this.
-- [ ] check snapshots alignment for map case.
+- [x] check snapshots alignment for map case. We do not need this one.
+- [ ] Show number of spectra in 2D map areas.

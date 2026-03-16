@@ -62,6 +62,64 @@ def load_signal(path: str):
     return signal
 
 
+def describe_signal_layout(signal) -> str:
+    if isinstance(signal, (list, tuple)):
+        return f"{type(signal).__name__} with {len(signal)} entries"
+
+    class_name = signal.__class__.__name__
+    data = getattr(signal, "data", None)
+    shape = tuple(np.asarray(data).shape) if data is not None else None
+    axes_manager = getattr(signal, "axes_manager", None)
+    signal_dimension = getattr(axes_manager, "signal_dimension", None)
+    navigation_dimension = getattr(axes_manager, "navigation_dimension", None)
+    return (
+        f"{class_name} with shape {shape}, "
+        f"signal_dimension={signal_dimension}, navigation_dimension={navigation_dimension}"
+    )
+
+
+def ensure_supported_eels_signal(signal):
+    if isinstance(signal, (list, tuple)):
+        raise ValueError(
+            "Unsupported EELS dataset: this file contains multiple signals. "
+            "Open a single 3D Signal1D map `(y, x, energy)` or 3D Signal2D snapshot stack "
+            f"`(frame, y, energy)`. Got {describe_signal_layout(signal)}."
+        )
+
+    data = getattr(signal, "data", None)
+    if data is None:
+        raise ValueError(
+            "Unsupported EELS dataset: the loaded object does not expose signal data. "
+            f"Got {describe_signal_layout(signal)}."
+        )
+
+    data = np.asarray(data)
+    axes_manager = getattr(signal, "axes_manager", None)
+    signal_dimension = getattr(axes_manager, "signal_dimension", None)
+    navigation_dimension = getattr(axes_manager, "navigation_dimension", None)
+
+    supported_layout = (
+        data.ndim == 3
+        and signal_dimension in (1, 2)
+        and (
+            navigation_dimension is None
+            or navigation_dimension == data.ndim - int(signal_dimension)
+        )
+    )
+    if not supported_layout:
+        raise ValueError(
+            "Unsupported EELS dataset: expected a 3D Signal1D map `(y, x, energy)` or "
+            "3D Signal2D snapshot stack `(frame, y, energy)`. "
+            f"Got {describe_signal_layout(signal)}."
+        )
+
+    return signal
+
+
+def load_eels_signal(path: str):
+    return ensure_supported_eels_signal(load_signal(path))
+
+
 def axis_from_signal(signal, axis_index: int = -1) -> np.ndarray:
     axes = signal.axes_manager.signal_axes
     if axes:

@@ -1,6 +1,6 @@
 import numpy as np
 
-from vibeels.processing import fit_zero_loss_peak, process_map_dataset
+from vibeels.processing import ensure_supported_eels_signal, fit_zero_loss_peak, process_map_dataset
 
 
 class FakeAxis:
@@ -9,14 +9,24 @@ class FakeAxis:
 
 
 class FakeAxesManager:
-    def __init__(self, axis):
+    def __init__(self, axis, signal_dimension=1, navigation_dimension=None):
         self.signal_axes = [FakeAxis(axis)]
+        self.signal_dimension = signal_dimension
+        self.navigation_dimension = navigation_dimension
 
 
 class FakeSignal:
-    def __init__(self, data, axis):
+    def __init__(self, data, axis, *, signal_dimension=1, navigation_dimension=None):
         self.data = data
-        self.axes_manager = FakeAxesManager(axis)
+        self.axes_manager = FakeAxesManager(axis, signal_dimension, navigation_dimension)
+
+
+class Signal1D(FakeSignal):
+    pass
+
+
+class Signal2D(FakeSignal):
+    pass
 
 
 def test_fit_zero_loss_peak_recenters_axis():
@@ -41,7 +51,7 @@ def test_process_map_dataset_selects_thresholded_roi():
             data[y, x] = base
     data[0, 0] *= 0.01
 
-    signal = FakeSignal(data, axis)
+    signal = Signal1D(data, axis)
     result = process_map_dataset(
         signal,
         energy_range=(20, 80),
@@ -55,3 +65,56 @@ def test_process_map_dataset_selects_thresholded_roi():
     assert np.max(np.abs(result.selected_zlp_centers_ev - np.mean(result.selected_zlp_centers_ev))) < 0.01
     assert abs(result.zero_loss_fit.center_ev) < 0.003
     assert result.masked_image.shape == (4, 5)
+
+
+def test_ensure_supported_eels_signal_accepts_3d_map_signal():
+    signal = Signal1D(
+        np.zeros((4, 5, 128), dtype=float),
+        np.linspace(-0.1, 0.2, 128),
+        signal_dimension=1,
+        navigation_dimension=2,
+    )
+
+    assert ensure_supported_eels_signal(signal) is signal
+
+
+def test_ensure_supported_eels_signal_accepts_3d_snapshot_signal():
+    signal = Signal2D(
+        np.zeros((7, 12, 128), dtype=float),
+        np.linspace(-0.1, 0.2, 128),
+        signal_dimension=2,
+        navigation_dimension=1,
+    )
+
+    assert ensure_supported_eels_signal(signal) is signal
+
+
+def test_ensure_supported_eels_signal_rejects_non_3d_input():
+    signal = Signal1D(
+        np.zeros(128, dtype=float),
+        np.linspace(-0.1, 0.2, 128),
+        signal_dimension=1,
+        navigation_dimension=0,
+    )
+
+    try:
+        ensure_supported_eels_signal(signal)
+    except ValueError as exc:
+        assert "Unsupported EELS dataset" in str(exc)
+        assert "shape (128,)" in str(exc)
+    else:
+        raise AssertionError("Expected non-3D input to be rejected.")
+
+
+def test_ensure_supported_eels_signal_rejects_multiple_loaded_signals():
+    signals = [
+        Signal1D(np.zeros((4, 5, 128), dtype=float), np.linspace(-0.1, 0.2, 128)),
+        Signal1D(np.zeros((4, 5, 128), dtype=float), np.linspace(-0.1, 0.2, 128)),
+    ]
+
+    try:
+        ensure_supported_eels_signal(signals)
+    except ValueError as exc:
+        assert "multiple signals" in str(exc)
+    else:
+        raise AssertionError("Expected multi-signal input to be rejected.")
