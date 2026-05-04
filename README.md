@@ -1,5 +1,7 @@
 # vibeels
 
+[![DOI](https://zenodo.org/badge/1174978017.svg)](https://doi.org/10.5281/zenodo.20018423)
+
 `vibeels` is a PyQt6 application for extracting and calibrating vibrational electron energy-loss spectroscopy (EELS) spectra. It supports map-based and snapshot-stack workflows, with zero-loss peak (ZLP) alignment and calibrated spectrum export.
 
 ## Status
