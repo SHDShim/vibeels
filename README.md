@@ -1,6 +1,6 @@
 # vibeels
 
-`vibeels` is a PyQt6 application for vibrational EELS spectrum extraction and zero-loss peak calibration using HyperSpy.
+`vibeels` is a PyQt6 application for extracting and calibrating vibrational electron energy-loss spectroscopy (EELS) spectra. It supports map-based and snapshot-stack workflows, with zero-loss peak (ZLP) alignment and calibrated spectrum export.
 
 ## Status
 
@@ -8,15 +8,21 @@
 
 ## Features
 
-- `Signal1D` map workflow with multiple polygon ROIs and intensity masking
-- `Signal2D` snapshot workflow with detector-band extraction and alignment
-- Zero-loss peak fitting and calibrated spectrum display
-- Export of spectrum data, parameters, and reproducibility bundle
-- Session saving and restoration for reproducible analysis workflows
+- `Signal1D` 2D map workflow with multiple polygon ROIs.
+- `Signal2D` snapshot-stack workflow with a single rectangular detector-band ROI.
+- Shared plot controls for zoom, ROI editing, zoom-out, and ROI clearing.
+- Intensity masking using a full-map histogram for 2D map data.
+- Per-spectrum ZLP fitting, alignment, and calibrated summed spectra.
+- Raw and aligned snapshot previews with independent zoom control.
+- Export of spectra, masks, figures, parameters, and reproducibility bundles.
+- Session saving and restoration.
+- Runtime application icon support on macOS and Windows.
 
 ## Installation
 
 ### From PyPI
+
+After the package is published to PyPI:
 
 ```bash
 python -m pip install vibeels
@@ -25,7 +31,7 @@ python -m pip install vibeels
 ### From source
 
 ```bash
-git clone https://github.com/danshim/vibeels.git
+git clone https://github.com/shdshim/vibeels.git
 cd vibeels
 python -m pip install -e .
 ```
@@ -41,19 +47,45 @@ python -m pip install -e .
 ## How to use
 
 1. Launch the application and load an EELS dataset with `Load EELS DM3/DM4`.
-2. If needed, load a reference image in the `Image` tab to help define the region of interest.
-3. For `Signal1D` data, use the `2D Map` tab:
-   - draw one or more polygon ROIs over the areas you want to analyze
-   - adjust the map energy range and intensity mask as needed
-   - click `Apply ROI / Alignment` to extract and align the spectra
-4. For `Signal2D` data, use the `1D Spot` tab:
-   - choose the detector row range that contains the zero-loss peak signal
-   - set the snapshot range to include the frames you want to process
-   - click `Apply ROI / Alignment` to align the snapshots and build the summed spectrum
-5. Inspect the `Calibration` tab to review the ZLP fit, FWHM, calibrated spectrum, and preview plots. If the alignment looks off, adjust the ROI or fit window and process again.
-6. Export the processed data when you are satisfied with the result, or save the current session state for later review.
+2. If needed, load a reference image in the `Image` tab.
+3. Use the shared plot controls above the figures:
+   - `Zoom`: mouse zoom behavior for all four main plots.
+   - `ROI`: ROI editing on the top-left raw-data plot.
+   - `Zoom Out`: reset zoom for all four main plots.
+   - `Clear ROI`: remove the active ROI selection.
+4. For `Signal1D` map data, use the `2D Map` tab:
+   - draw one or more polygon ROIs on the top-left map preview.
+   - adjust the map energy range.
+   - use the full-map intensity histogram to set the mask range.
+   - click `Apply ROI / Alignment` to extract, align, and sum all spectra inside any polygon and inside the intensity range.
+5. For `Signal2D` snapshot-stack data, use the `1D Spot` tab:
+   - draw or set one rectangular detector-y ROI.
+   - set the snapshot range and snapshot index.
+   - click `Apply ROI / Alignment` to align snapshots and build the summed spectrum.
+6. Inspect the `Calibration` tab to review the ZLP fit, FWHM, calibrated spectrum, and previews.
+7. Save selected spectra in the `Saved` tab, export the processed bundle, or save the session state for later review.
 
-## Run locally
+## ROI and Plot Controls
+
+- 2D map mode allows multiple polygon ROIs. Pixels inside any polygon are included.
+- 1D snapshot mode allows one rectangular detector-y ROI.
+- In 2D map mode, the intensity histogram always represents the full integrated image, not only the ROI pixels.
+- Right-click in `Zoom` mode resets only the clicked plot.
+- Right-click inside an ROI in `ROI` mode clears that ROI.
+- Zoom state is preserved during ROI changes and snapshot navigation unless `Zoom Out` or right-click zoom reset is used.
+
+## Outputs
+
+Exports include:
+
+- calibrated spectra
+- selected masks and preview images
+- ZLP fit data
+- processing parameters
+- reproducibility scripts and figures
+- saved session state
+
+## Run
 
 ```bash
 python -m vibeels
@@ -72,6 +104,13 @@ python -m pip install build twine
 python -m build
 python -m twine check dist/*
 ```
+
+## Release Metadata
+
+- Package name: `vibeels`
+- Current version: `0.3.0`
+- Repository: <https://github.com/shdshim/vibeels>
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Citation
 

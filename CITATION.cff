@@ -6,7 +6,7 @@ date-released: 2026-05-04
 authors:
   - family-names: Shim
     given-names: Dan
-repository-code: "https://github.com/danshim/vibeels"
+repository-code: "https://github.com/shdshim/vibeels"
 license: MIT
 keywords:
   - EELS

@@ -33,10 +33,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/danshim/vibeels"
-Repository = "https://github.com/danshim/vibeels"
-Issues = "https://github.com/danshim/vibeels/issues"
-Changelog = "https://github.com/danshim/vibeels/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/shdshim/vibeels"
+Repository = "https://github.com/shdshim/vibeels"
+Issues = "https://github.com/shdshim/vibeels/issues"
+Changelog = "https://github.com/shdshim/vibeels/blob/main/CHANGELOG.md"
 
 [project.scripts]
 vibeels = "vibeels.app:main"
