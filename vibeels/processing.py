@@ -47,6 +47,7 @@ class MapProcessingResult:
 class StackProcessingResult:
     detector_image_raw: np.ndarray
     aligned_stack: np.ndarray
+    vertical_range: Tuple[int, int]
     summed_spectrum: np.ndarray
     energy_axis_raw: np.ndarray
     energy_axis_calibrated: np.ndarray
@@ -453,9 +454,12 @@ def process_snapshot_stack(
 
     emit_progress(progress_callback, 85, 100, "Estimating 2D shifts")
     aligned_stack_signal = hs.signals.Signal2D(np.asarray(aligned_slices, dtype=float))
-    shifts = aligned_stack_signal.estimate_shift2D()
+    shifts = np.asarray(aligned_stack_signal.estimate_shift2D(), dtype=float)
+    if shifts.ndim == 2 and shifts.shape[1] >= 2:
+        shifts[:, 1] = 0.0
     emit_progress(progress_callback, 92, 100, "Applying 2D alignment")
-    aligned_stack_signal.align2D(shifts=shifts, crop=False, fill_value=0.0)
+    if np.any(np.abs(shifts) > 0):
+        aligned_stack_signal.align2D(shifts=shifts, crop=False, fill_value=0.0)
     aligned_stack = np.asarray(aligned_stack_signal.data, dtype=float)
 
     summed_spectrum = aligned_stack.sum(axis=0).sum(axis=0)
@@ -472,6 +476,7 @@ def process_snapshot_stack(
     return StackProcessingResult(
         detector_image_raw=np.asarray(detector_image_raw, dtype=float),
         aligned_stack=aligned_stack,
+        vertical_range=(int(y_start), int(y_stop)),
         summed_spectrum=np.asarray(summed_spectrum, dtype=float),
         energy_axis_raw=np.asarray(energy_axis, dtype=float),
         energy_axis_calibrated=zlp_fit.calibrated_axis,

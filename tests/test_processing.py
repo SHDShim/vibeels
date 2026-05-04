@@ -67,6 +67,33 @@ def test_process_map_dataset_selects_thresholded_roi():
     assert result.masked_image.shape == (4, 5)
 
 
+def test_process_map_dataset_integrates_all_disjoint_roi_pixels():
+    axis = np.linspace(-0.1, 0.2, 128)
+    data = np.zeros((4, 5, axis.size), dtype=float)
+    for y in range(4):
+        for x in range(5):
+            center = 0.006 + (y * 0.0002) + (x * 0.0001)
+            data[y, x] = np.exp(-((axis - center) ** 2) / (2 * 0.003**2)) * 1000
+
+    polygon_mask = np.zeros((4, 5), dtype=bool)
+    polygon_mask[0, 1] = True
+    polygon_mask[0, 2] = True
+    polygon_mask[3, 3] = True
+    polygon_mask[3, 4] = True
+
+    result = process_map_dataset(
+        Signal1D(data, axis),
+        energy_range=(20, 80),
+        polygon_mask=polygon_mask,
+        intensity_range=(1.0, 1e9),
+    )
+
+    assert result.selected_pixel_count == 4
+    assert np.array_equal(result.selection_mask, polygon_mask)
+    assert result.selected_spectra.shape == (4, axis.size)
+    assert result.summed_spectrum.shape == axis.shape
+
+
 def test_ensure_supported_eels_signal_accepts_3d_map_signal():
     signal = Signal1D(
         np.zeros((4, 5, 128), dtype=float),

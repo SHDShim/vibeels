@@ -64,6 +64,39 @@ MessageBoxButton = QtWidgets.QMessageBox.StandardButton
 configure_matplotlib_defaults()
 
 
+def _application_icon_path() -> Optional[Path]:
+    package_root = Path(__file__).resolve().parent
+    candidates = [
+        package_root / "assets" / "icons" / "vibeels.png",
+        package_root.parent / "asset" / "icons" / "vibeels.png",
+        package_root.parent / "asset" / "icon.png",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _application_icon() -> Optional[QtGui.QIcon]:
+    icon_path = _application_icon_path()
+    if icon_path is None:
+        return None
+    icon = QtGui.QIcon(str(icon_path))
+    return icon if not icon.isNull() else None
+
+
+def _set_macos_dock_icon(icon_path: Optional[Path]) -> None:
+    if sys.platform != "darwin" or icon_path is None:
+        return
+    try:
+        from AppKit import NSApplication, NSImage
+    except Exception:
+        return
+    image = NSImage.alloc().initWithContentsOfFile_(str(icon_path))
+    if image is not None:
+        NSApplication.sharedApplication().setApplicationIconImage_(image)
+
+
 @dataclass
 class LoadedData:
     eels_signal: object
@@ -79,7 +112,7 @@ class SavedMapEntry:
     locked: bool
     comment: str
     roi_text: str
-    polygon_vertices: list[tuple[float, float]]
+    polygon_vertices: list
     selection_mask: np.ndarray
     display_image: np.ndarray
     masked_image: np.ndarray
@@ -319,6 +352,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"vibeels {__version__}")
+        icon = _application_icon()
+        if icon is not None:
+            self.setWindowIcon(icon)
         self.resize(1440, 900)
 
         self.settings = QtCore.QSettings("vibeels", "vibeels")
@@ -326,11 +362,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.current_result: Optional[object] = None
         self.selector: Optional[object] = None
         self.selection_rect: Optional[Rectangle] = None
-        self.selection_polygon: Optional[Polygon] = None
+        self.selection_polygons: list[Polygon] = []
         self._image_view_limits: Optional[tuple[tuple[float, float], tuple[float, float]]] = None
         self._corrected_view_limits: Optional[tuple[tuple[float, float], tuple[float, float]]] = None
         self._syncing_corrected_xlim = False
-        self.map_polygon_vertices: Optional[list[tuple[float, float]]] = None
+        self.map_polygon_vertices: list[list[tuple[float, float]]] = []
         self._map_intensity_min = 0.0
         self._map_intensity_max = 1.0
         self.saved_map_entries: list[SavedMapEntry] = []
@@ -344,6 +380,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self._snapshot_intensity_min = 0.0
         self._snapshot_intensity_max = 1.0
         self._active_snapshot_histogram_handle: Optional[str] = None
+        self._plot_toolbars: dict[FigureCanvas, NavigationToolbar] = {}
+        self._mouse_mode = "zoom"
+        self._main_canvas_mouse_cids: list[tuple[FigureCanvas, int]] = []
 
         self._build_ui()
         self._apply_default_ranges()
@@ -409,9 +448,270 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             button.clicked.connect(slot)
         return button
 
+    def _make_plot_toolbar(self, canvas: FigureCanvas) -> NavigationToolbar:
+        toolbar = NavigationToolbar(canvas, self)
+        toolbar.hide()
+        self._plot_toolbars[canvas] = toolbar
+        return toolbar
+
+    def _style_mouse_mode_buttons(self) -> None:
+        self.zoom_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #eee8dc;
+                border: 1px solid #7b7569;
+                border-top-left-radius: 8px;
+                border-bottom-left-radius: 8px;
+                color: #2b2924;
+                font-size: 13px;
+                font-weight: 700;
+                padding: 2px 14px;
+            }
+            QPushButton:checked {
+                background-color: #d9a400;
+                border-color: #8a6b00;
+                color: #17130a;
+            }
+            """
+        )
+        self.roi_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #eee8dc;
+                border: 1px solid #7b7569;
+                border-left: 0;
+                border-top-right-radius: 8px;
+                border-bottom-right-radius: 8px;
+                color: #2b2924;
+                font-size: 13px;
+                font-weight: 700;
+                padding: 2px 14px;
+            }
+            QPushButton:checked {
+                background-color: #d9a400;
+                border-color: #8a6b00;
+                color: #17130a;
+            }
+            """
+        )
+
+    def _set_mouse_mode(self, mode: str, warn: bool = False) -> None:
+        if mode not in {"zoom", "roi"}:
+            return
+        if warn:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "ROI unavailable",
+                "ROI editing is available only in the top-left graph. Switching to zoom.",
+            )
+            self._log("ROI editing is available only in the top-left graph. Switched to zoom.")
+
+        self._mouse_mode = mode
+        self.zoom_button.blockSignals(True)
+        self.roi_button.blockSignals(True)
+        self.zoom_button.setChecked(mode == "zoom")
+        self.roi_button.setChecked(mode == "roi")
+        self.zoom_button.blockSignals(False)
+        self.roi_button.blockSignals(False)
+
+        for toolbar in self._plot_toolbars.values():
+            if toolbar.mode:
+                toolbar.zoom()
+        if mode == "zoom":
+            for toolbar in self._plot_toolbars.values():
+                toolbar.zoom()
+        self._sync_selector_state()
+
+    def _connect_main_canvas_mouse_events(self) -> None:
+        for canvas in [self.image_canvas, self.corrected_canvas, self.fit_canvas, self.spectrum_canvas]:
+            cid = canvas.mpl_connect("button_press_event", self._on_main_canvas_button_press)
+            self._main_canvas_mouse_cids.append((canvas, cid))
+
+    def _on_main_canvas_button_press(self, event) -> None:
+        if event.button == 3 and self._mouse_mode == "zoom":
+            self._reset_canvas_view(event.canvas)
+            return
+
+        if self._mouse_mode != "roi":
+            return
+
+        if event.canvas is not self.image_canvas:
+            self._set_mouse_mode("zoom", warn=True)
+            return
+
+        if event.button != 3:
+            return
+        if self._current_mode_index() == 0 and self._point_inside_current_polygon(event.xdata, event.ydata):
+            self._remove_map_roi_at_point(event.xdata, event.ydata)
+        elif self._current_mode_index() == 1 and self._point_inside_current_spot_roi(event.xdata, event.ydata):
+            self._clear_spot_roi()
+
+    def _reset_canvas_view(self, canvas: FigureCanvas) -> None:
+        if canvas is self.image_canvas:
+            self._image_view_limits = None
+        if canvas is self.corrected_canvas:
+            self._corrected_view_limits = None
+        if self._reset_snapshot_image_canvas_view(canvas):
+            return
+        toolbar = self._plot_toolbars.get(canvas)
+        if toolbar is not None:
+            toolbar.home()
+
+    def _reset_all_canvas_views(self) -> None:
+        self._image_view_limits = None
+        self._corrected_view_limits = None
+        for canvas, toolbar in self._plot_toolbars.items():
+            if not self._reset_snapshot_image_canvas_view(canvas):
+                toolbar.home()
+
+    def _reset_snapshot_image_canvas_view(self, canvas: FigureCanvas) -> bool:
+        if self._current_mode_index() != 1 or canvas not in {self.image_canvas, self.corrected_canvas}:
+            return False
+        if not canvas.figure.axes:
+            return False
+        axis = canvas.figure.axes[0]
+        if not axis.images:
+            return False
+        image_shape = axis.images[0].get_array().shape
+        if len(image_shape) < 2:
+            return False
+        height, width = int(image_shape[0]), int(image_shape[1])
+        axis.set_xlim(0, width - 1)
+        axis.set_ylim(height - 1, 0)
+        if canvas is self.image_canvas:
+            self._image_view_limits = (axis.get_xlim(), axis.get_ylim())
+        else:
+            self._corrected_view_limits = (axis.get_xlim(), axis.get_ylim())
+        canvas.draw_idle()
+        return True
+
+    def _point_inside_current_polygon(self, x: Optional[float], y: Optional[float]) -> bool:
+        if x is None or y is None:
+            return False
+        point = (float(x), float(y))
+        return any(
+            len(vertices) >= 3 and MplPath(vertices).contains_point(point, radius=0.5)
+            for vertices in self.map_polygon_vertices
+        )
+
+    def _point_inside_current_spot_roi(self, x: Optional[float], y: Optional[float]) -> bool:
+        if x is None or y is None or self.loaded is None or self._current_mode_index() != 1:
+            return False
+        data = np.asarray(self.loaded.eels_signal.data)
+        if data.ndim != 3:
+            return False
+        y0, y1 = sorted((self.stack_y0.value(), self.stack_y1.value()))
+        return 0 <= float(x) <= data.shape[2] and y0 <= float(y) <= y1
+
+    def _clear_map_roi(self) -> None:
+        if self._current_mode_index() != 0:
+            return
+        self.map_polygon_vertices = []
+        self._reset_map_histogram_controls()
+        self._draw_initial_image()
+        self._update_clear_roi_button_enabled()
+
+    def _remove_map_roi_at_point(self, x: Optional[float], y: Optional[float]) -> None:
+        if x is None or y is None:
+            return
+        point = (float(x), float(y))
+        for index in range(len(self.map_polygon_vertices) - 1, -1, -1):
+            vertices = self.map_polygon_vertices[index]
+            if len(vertices) >= 3 and MplPath(vertices).contains_point(point, radius=0.5):
+                del self.map_polygon_vertices[index]
+                self._reset_map_histogram_controls(preserve_mask_range=True)
+                self._draw_initial_image()
+                self._update_clear_roi_button_enabled()
+                return
+
+    def _clear_current_roi(self) -> None:
+        if self._current_mode_index() == 0:
+            self._clear_map_roi()
+        else:
+            self._clear_spot_roi()
+
+    def _clear_spot_roi(self) -> None:
+        if self.loaded is None or self._current_mode_index() != 1:
+            return
+        data = np.asarray(self.loaded.eels_signal.data)
+        if data.ndim != 3:
+            return
+        self.stack_y0.blockSignals(True)
+        self.stack_y1.blockSignals(True)
+        self.stack_y0.setValue(0)
+        self.stack_y1.setValue(data.shape[1])
+        self.stack_y0.blockSignals(False)
+        self.stack_y1.blockSignals(False)
+        self._update_selection_overlay()
+        self._update_clear_roi_button_enabled()
+
+    def _spot_roi_is_full_detector(self) -> bool:
+        if self.loaded is None or self._current_mode_index() != 1:
+            return True
+        data = np.asarray(self.loaded.eels_signal.data)
+        if data.ndim != 3:
+            return True
+        return self.stack_y0.value() <= 0 and self.stack_y1.value() >= data.shape[1]
+
+    def _update_clear_roi_button_enabled(self) -> None:
+        if hasattr(self, "clear_roi_button"):
+            if self._current_mode_index() == 0:
+                self.clear_roi_button.setEnabled(bool(self.map_polygon_vertices))
+            else:
+                self.clear_roi_button.setEnabled(not self._spot_roi_is_full_detector())
+
+    def _coerce_polygon_list(self, raw_vertices) -> list[list[tuple[float, float]]]:
+        if not raw_vertices:
+            return []
+        first = raw_vertices[0]
+        if isinstance(first, (list, tuple)) and len(first) == 2 and all(np.isscalar(value) for value in first):
+            return [[(float(x), float(y)) for x, y in raw_vertices]]
+        polygons: list[list[tuple[float, float]]] = []
+        for polygon in raw_vertices:
+            vertices = [(float(x), float(y)) for x, y in polygon]
+            if len(vertices) >= 3:
+                polygons.append(vertices)
+        return polygons
+
+    def _entry_polygon_list(self, entry: SavedMapEntry) -> list[list[tuple[float, float]]]:
+        return self._coerce_polygon_list(entry.polygon_vertices)
+
     def _prepare_image_axis(self, axis):
         axis.grid(False)
         return axis
+
+    def _capture_current_image_view(self) -> None:
+        if self.loaded is None or self._current_mode_index() != 1 or not self.image_canvas.figure.axes:
+            return
+        axis = self.image_canvas.figure.axes[0]
+        if not axis.images:
+            return
+        self._image_view_limits = (axis.get_xlim(), axis.get_ylim())
+
+    def _capture_current_corrected_view(self) -> None:
+        if self.loaded is None or self._current_mode_index() != 1 or not self.corrected_canvas.figure.axes:
+            return
+        axis = self.corrected_canvas.figure.axes[0]
+        if not axis.images:
+            return
+        self._corrected_view_limits = (axis.get_xlim(), axis.get_ylim())
+
+    def _on_image_view_changed(self, image_ax):
+        if image_ax.images and self._current_mode_index() == 1:
+            self._image_view_limits = (image_ax.get_xlim(), image_ax.get_ylim())
+
+    def _set_empty_axis_message(self, axis, message: str) -> None:
+        axis.text(
+            0.5,
+            0.5,
+            message,
+            ha="center",
+            va="center",
+            wrap=True,
+            transform=axis.transAxes,
+            fontsize=max(8, self._current_title_font_size()),
+        )
+        axis.set_axis_off()
 
     def _current_title_font_size(self) -> int:
         return int(self.title_font_size_combo.currentData()) if hasattr(self, "title_font_size_combo") else 10
@@ -451,24 +751,51 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
+        self.mouse_mode_group = QtWidgets.QButtonGroup(self)
+        self.mouse_mode_group.setExclusive(True)
+        self.zoom_button = QtWidgets.QPushButton("Zoom")
+        self.roi_button = QtWidgets.QPushButton("ROI")
+        self.zoom_out_button = self._make_button("Zoom Out", self._reset_all_canvas_views)
+        self.clear_roi_button = self._make_button("Clear ROI", self._clear_current_roi)
+        action_button_height = self.zoom_out_button.sizeHint().height()
+        for button in [self.zoom_button, self.roi_button]:
+            button.setCheckable(True)
+            button.setFixedHeight(action_button_height)
+            button.setMinimumWidth(76)
+            button.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.zoom_button.setChecked(True)
+        self.mouse_mode_group.addButton(self.zoom_button)
+        self.mouse_mode_group.addButton(self.roi_button)
+        self.zoom_button.clicked.connect(lambda: self._set_mouse_mode("zoom"))
+        self.roi_button.clicked.connect(lambda: self._set_mouse_mode("roi"))
+        self._style_mouse_mode_buttons()
+
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.setContentsMargins(12, 8, 0, 0)
+        mode_row.setSpacing(0)
+        mode_row.addWidget(self.zoom_button)
+        mode_row.addWidget(self.roi_button)
+        mode_row.addSpacing(8)
+        mode_row.addWidget(self.zoom_out_button)
+        mode_row.addWidget(self.clear_roi_button)
+        mode_row.addStretch(1)
+        left_layout.addLayout(mode_row)
+
         top_row = QtWidgets.QHBoxLayout()
 
         image_panel = QtWidgets.QVBoxLayout()
         self.image_canvas = PlotCanvas((1, 1), self)
-        self.image_toolbar = NavigationToolbar(self.image_canvas, self)
-        image_panel.addWidget(self.image_toolbar)
+        self.image_toolbar = self._make_plot_toolbar(self.image_canvas)
         image_panel.addWidget(self.image_canvas, 1)
 
         corrected_panel = QtWidgets.QVBoxLayout()
         self.corrected_canvas = PlotCanvas((1, 1), self)
-        self.corrected_toolbar = NavigationToolbar(self.corrected_canvas, self)
-        corrected_panel.addWidget(self.corrected_toolbar)
+        self.corrected_toolbar = self._make_plot_toolbar(self.corrected_canvas)
         corrected_panel.addWidget(self.corrected_canvas, 1)
 
         fit_panel = QtWidgets.QVBoxLayout()
         self.fit_canvas = PlotCanvas((1, 1), self)
-        self.fit_toolbar = NavigationToolbar(self.fit_canvas, self)
-        fit_panel.addWidget(self.fit_toolbar)
+        self.fit_toolbar = self._make_plot_toolbar(self.fit_canvas)
         fit_panel.addWidget(self.fit_canvas, 1)
 
         top_row.addLayout(image_panel, 1)
@@ -477,9 +804,10 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         left_layout.addLayout(top_row, 1)
 
         self.spectrum_canvas = PlotCanvas((1, 1), self)
-        self.spectrum_toolbar = NavigationToolbar(self.spectrum_canvas, self)
-        left_layout.addWidget(self.spectrum_toolbar)
+        self.spectrum_toolbar = self._make_plot_toolbar(self.spectrum_canvas)
         left_layout.addWidget(self.spectrum_canvas, 1)
+        self._connect_main_canvas_mouse_events()
+        self._set_mouse_mode("zoom")
         splitter.addWidget(left_panel)
 
         right_panel = QtWidgets.QWidget()
@@ -592,9 +920,6 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QFormLayout(tab)
 
-        self.enable_selector = QtWidgets.QCheckBox("Enable mouse ROI editing")
-        self.enable_selector.setChecked(True)
-        self.enable_selector.toggled.connect(self._sync_selector_state)
         self.normalize_saved_spectra_checkbox = QtWidgets.QCheckBox("Normalize spectra intensity")
         self.normalize_saved_spectra_checkbox.toggled.connect(self._update_view_for_active_tab)
         export_button = self._make_button("Export NPY", self._save_results)
@@ -613,13 +938,6 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.title_font_size_combo.currentIndexChanged.connect(self._on_title_font_size_changed)
         set_spinbox_max_width_fraction(self.title_font_size_combo, 0.25)
 
-        helper = QtWidgets.QLabel(
-            "Controls mouse-based polygon editing in 2D Map and extraction-band dragging in 1D Spot."
-        )
-        helper.setWordWrap(True)
-
-        layout.addRow(self.enable_selector)
-        layout.addRow(helper)
         layout.addRow(self.normalize_saved_spectra_checkbox)
         layout.addRow(export_button)
         layout.addRow("Title font size", self.title_font_size_combo)
@@ -637,21 +955,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.threshold_spin.setValue(18000.0)
         self.threshold_spin.hide()
 
-        self.roi_x0 = QtWidgets.QSpinBox()
-        self.roi_x1 = QtWidgets.QSpinBox()
-        self.roi_y0 = QtWidgets.QSpinBox()
-        self.roi_y1 = QtWidgets.QSpinBox()
-        for widget in [self.roi_x0, self.roi_x1, self.roi_y0, self.roi_y1]:
-            widget.setMaximum(100000)
-            widget.valueChanged.connect(self._update_selection_overlay)
-
         for widget in [
             self.energy_start_spin,
             self.energy_stop_spin,
-            self.roi_x0,
-            self.roi_x1,
-            self.roi_y0,
-            self.roi_y1,
         ]:
             set_spinbox_max_width_fraction(widget)
 
@@ -677,10 +983,6 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.map_mode_widgets = [
             self.energy_start_spin,
             self.energy_stop_spin,
-            self.roi_x0,
-            self.roi_x1,
-            self.roi_y0,
-            self.roi_y1,
             self.map_mask_slider,
             self.map_hist_canvas,
             self.map_mask_min_label,
@@ -693,14 +995,6 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         map_grid.addWidget(self.energy_start_spin, 0, 1)
         map_grid.addWidget(QtWidgets.QLabel("Map-z pixel stop"), 0, 2)
         map_grid.addWidget(self.energy_stop_spin, 0, 3)
-        map_grid.addWidget(QtWidgets.QLabel("ROI x start"), 1, 0)
-        map_grid.addWidget(self.roi_x0, 1, 1)
-        map_grid.addWidget(QtWidgets.QLabel("ROI x stop"), 1, 2)
-        map_grid.addWidget(self.roi_x1, 1, 3)
-        map_grid.addWidget(QtWidgets.QLabel("ROI y start"), 2, 0)
-        map_grid.addWidget(self.roi_y0, 2, 1)
-        map_grid.addWidget(QtWidgets.QLabel("ROI y stop"), 2, 2)
-        map_grid.addWidget(self.roi_y1, 2, 3)
         map_grid.setColumnStretch(0, 0)
         map_grid.setColumnStretch(1, 1)
         map_grid.setColumnStretch(2, 0)
@@ -970,12 +1264,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
     def _current_map_roi_text(self) -> str:
         if self.map_polygon_vertices:
-            return "; ".join(f"({x:.1f}, {y:.1f})" for x, y in self.map_polygon_vertices)
-        if isinstance(self.current_result, MapProcessingResult):
-            ys, xs = np.where(self.current_result.selection_mask)
-            if xs.size and ys.size:
-                return f"x={int(xs.min())}:{int(xs.max())}, y={int(ys.min())}:{int(ys.max())}"
-        return "-"
+            return " | ".join(
+                f"ROI {index + 1}: " + "; ".join(f"({x:.1f}, {y:.1f})" for x, y in vertices)
+                for index, vertices in enumerate(self.map_polygon_vertices)
+            )
+        return "Full map"
 
     def _current_spot_roi_text(self) -> str:
         return (
@@ -1098,8 +1391,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         ax = self.reference_image_canvas.reset_axis()
         image = self._current_reference_image_data()
         if image is None:
-            ax.text(0.5, 0.5, "Load a reference image to preview it here", ha="center", va="center")
-            ax.set_axis_off()
+            self._set_empty_axis_message(ax, "Load a reference image to preview it here")
             self.reference_image_min_label.setText("Z min: -")
             self.reference_image_max_label.setText("Z max: -")
             self.reference_image_canvas.draw_idle()
@@ -1272,7 +1564,9 @@ class VibeelsWindow(QtWidgets.QMainWindow):
                     locked=bool(metadata.get("locked", False)),
                     comment=str(metadata.get("comment", "")),
                     roi_text=str(metadata.get("roi_text", "-")),
-                    polygon_vertices=[
+                    polygon_vertices=self._coerce_polygon_list(metadata.get("polygon_vertices", []))
+                    if str(metadata.get("mode", "map")) == "map"
+                    else [
                         (float(x), float(y))
                         for x, y in metadata.get("polygon_vertices", [])
                     ],
@@ -1306,7 +1600,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             "snapshot_index": self.snapshot_index_spin.value(),
             "fit_window": [self.fit_start_spin.value(), self.fit_stop_spin.value()],
             "guess_window": [self.guess_start_spin.value(), self.guess_stop_spin.value()],
-            "map_polygon_vertices": self.map_polygon_vertices or [],
+            "map_polygon_vertices": self.map_polygon_vertices,
             "normalize_saved_spectra": self.normalize_saved_spectra_checkbox.isChecked(),
             "title_font_size": int(self.title_font_size_combo.currentData()),
         }
@@ -1366,9 +1660,15 @@ if shown:
     for index, entry in shown:
         prefix = f"saved_map_{index}"
         color = plt.cm.tab10(index % 10)
-        vertices = [(float(x), float(y)) for x, y in entry.get("polygon_vertices", [])]
-        if vertices:
-            ax_roi.add_patch(Polygon(vertices, closed=True, fill=False, edgecolor=color, linewidth=1.8))
+        raw_vertices = entry.get("polygon_vertices", [])
+        if raw_vertices and len(raw_vertices[0]) == 2 and not isinstance(raw_vertices[0][0], (list, tuple)):
+            polygons = [raw_vertices]
+        else:
+            polygons = raw_vertices
+        for vertices in polygons:
+            vertices = [(float(x), float(y)) for x, y in vertices]
+            if vertices:
+                ax_roi.add_patch(Polygon(vertices, closed=True, fill=False, edgecolor=color, linewidth=1.8))
         masked = np.asarray(arrays[f"{prefix}_masked_image"], dtype=float)
         combined_mask = np.where(np.isfinite(masked), masked, combined_mask)
 
@@ -1470,7 +1770,7 @@ plt.show()
         self.saved_map_entries = []
         self._image_view_limits = None
         self._corrected_view_limits = None
-        self.map_polygon_vertices = None
+        self.map_polygon_vertices = []
         self.eels_path_label.setText(path)
         self.shape_label.setText(str(signal.data.shape))
         self.zlp_center_label.setText("-")
@@ -1549,8 +1849,7 @@ plt.show()
             self.guess_start_spin.setValue(float(guess_window[0]))
             self.guess_stop_spin.setValue(float(guess_window[1]))
 
-            polygon_vertices = metadata.get("map_polygon_vertices", [])
-            self.map_polygon_vertices = [(float(x), float(y)) for x, y in polygon_vertices] if polygon_vertices else None
+            self.map_polygon_vertices = self._coerce_polygon_list(metadata.get("map_polygon_vertices", []))
 
             slider_values = metadata.get(
                 "map_mask_slider",
@@ -1651,7 +1950,7 @@ plt.show()
                 locked=False,
                 comment=f"Map {len(self.saved_map_entries) + 1}",
                 roi_text=self._current_map_roi_text(),
-                polygon_vertices=list(self.map_polygon_vertices or []),
+                polygon_vertices=[list(vertices) for vertices in self.map_polygon_vertices],
                 selection_mask=np.asarray(self.current_result.selection_mask, dtype=bool).copy(),
                 display_image=np.asarray(self.current_result.display_image, dtype=float).copy(),
                 masked_image=np.asarray(self.current_result.masked_image, dtype=float).copy(),
@@ -1710,8 +2009,7 @@ plt.show()
 
         visible_entries = self._saved_map_entries_for_display()
         if not visible_entries:
-            spectrum_ax.text(0.5, 0.5, "No saved spectra selected for display", ha="center", va="center")
-            spectrum_ax.set_axis_off()
+            self._set_empty_axis_message(spectrum_ax, "No saved spectra selected for display")
             self.spectrum_canvas.draw_idle()
             return
 
@@ -1754,23 +2052,19 @@ plt.show()
 
     def _clear_saved_maps_preview(self):
         image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
-        image_ax.text(0.5, 0.5, "No saved entries selected for display", ha="center", va="center")
-        image_ax.set_axis_off()
+        self._set_empty_axis_message(image_ax, "No saved entries selected for display")
         self.image_canvas.draw_idle()
 
         corrected_ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
-        corrected_ax.text(0.5, 0.5, "No masked map preview", ha="center", va="center")
-        corrected_ax.set_axis_off()
+        self._set_empty_axis_message(corrected_ax, "No masked map preview")
         self.corrected_canvas.draw_idle()
 
         fit_ax = self.fit_canvas.reset_axis()
-        fit_ax.text(0.5, 0.5, "No ZLP alignment preview", ha="center", va="center")
-        fit_ax.set_axis_off()
+        self._set_empty_axis_message(fit_ax, "No ZLP alignment preview")
         self.fit_canvas.draw_idle()
 
         spectrum_ax = self.spectrum_canvas.reset_axis()
-        spectrum_ax.text(0.5, 0.5, "No saved spectra selected for display", ha="center", va="center")
-        spectrum_ax.set_axis_off()
+        self._set_empty_axis_message(spectrum_ax, "No saved spectra selected for display")
         self.spectrum_canvas.draw_idle()
 
     def _reset_analysis_canvases(self, mode_index: Optional[int] = None):
@@ -1779,7 +2073,7 @@ plt.show()
 
         self._detach_selector()
         self.selection_rect = None
-        self.selection_polygon = None
+        self.selection_polygons = []
         self._image_view_limits = None
         self._corrected_view_limits = None
 
@@ -1791,23 +2085,19 @@ plt.show()
             corrected_message = "Aligned snapshot image will appear here after processing"
 
         image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
-        image_ax.text(0.5, 0.5, image_message, ha="center", va="center")
-        image_ax.set_axis_off()
+        self._set_empty_axis_message(image_ax, image_message)
         self.image_canvas.draw_idle()
 
         corrected_ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
-        corrected_ax.text(0.5, 0.5, corrected_message, ha="center", va="center")
-        corrected_ax.set_axis_off()
+        self._set_empty_axis_message(corrected_ax, corrected_message)
         self.corrected_canvas.draw_idle()
 
         fit_ax = self.fit_canvas.reset_axis()
-        fit_ax.text(0.5, 0.5, "Zero-loss fit preview will appear here after processing", ha="center", va="center")
-        fit_ax.set_axis_off()
+        self._set_empty_axis_message(fit_ax, "Zero-loss fit preview will appear here after processing")
         self.fit_canvas.draw_idle()
 
         spectrum_ax = self.spectrum_canvas.reset_axis()
-        spectrum_ax.text(0.5, 0.5, "Summed spectrum will appear here after processing", ha="center", va="center")
-        spectrum_ax.set_axis_off()
+        self._set_empty_axis_message(spectrum_ax, "Summed spectrum will appear here after processing")
         self.spectrum_canvas.draw_idle()
 
     def _preview_selected_saved_maps(self):
@@ -1826,10 +2116,10 @@ plt.show()
         image_ax.set_ylabel("")
         for row, entry in preview_entries:
             color = self._saved_map_entry_color(row)
-            if entry.polygon_vertices:
+            for vertices in self._entry_polygon_list(entry):
                 image_ax.add_patch(
                     Polygon(
-                        entry.polygon_vertices,
+                        vertices,
                         closed=True,
                         fill=False,
                         edgecolor=color,
@@ -1967,14 +2257,7 @@ plt.show()
         self.energy_stop_spin.setMaximum(shape[-1])
         self.energy_stop_spin.setValue(min(self.energy_stop_spin.value(), shape[-1]))
 
-        if self._current_mode_index() == 0:
-            self.roi_x0.setMaximum(shape[1] - 1)
-            self.roi_x1.setMaximum(shape[1])
-            self.roi_y0.setMaximum(shape[0] - 1)
-            self.roi_y1.setMaximum(shape[0])
-            self.roi_x1.setValue(shape[1])
-            self.roi_y1.setValue(shape[0])
-        else:
+        if self._current_mode_index() != 0:
             self.stack_y0.setMaximum(shape[1] - 1)
             self.stack_y1.setMaximum(shape[1])
             self.stack_y1.setValue(min(max(self.stack_y1.value(), self.stack_y0.value() + 1), shape[1]))
@@ -2036,6 +2319,7 @@ plt.show()
             self.snapshot_next_button.setEnabled(False)
         else:
             self._update_snapshot_navigation_enabled()
+        self._update_clear_roi_button_enabled()
 
     def _map_intensity_image(self) -> Optional[np.ndarray]:
         if self.loaded is None or self._current_mode_index() != 0:
@@ -2047,20 +2331,21 @@ plt.show()
         e1 = max(e0 + 1, min(self.energy_stop_spin.value(), data.shape[2]))
         return data[:, :, e0:e1].sum(axis=2)
 
-    def _default_map_polygon(self, width: int, height: int) -> list[tuple[float, float]]:
-        return [(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)]
-
     def _current_polygon_mask(self) -> Optional[np.ndarray]:
         image = self._map_intensity_image()
         if image is None:
             return None
         height, width = image.shape
-        if not self.map_polygon_vertices or len(self.map_polygon_vertices) < 3:
-            self.map_polygon_vertices = self._default_map_polygon(width, height)
+        if not self.map_polygon_vertices:
+            return np.ones((height, width), dtype=bool)
         yy, xx = np.mgrid[0:height, 0:width]
         points = np.column_stack((xx.ravel(), yy.ravel()))
-        path = MplPath(self.map_polygon_vertices)
-        mask = path.contains_points(points, radius=0.5).reshape((height, width))
+        mask = np.zeros((height, width), dtype=bool)
+        for vertices in self.map_polygon_vertices:
+            if len(vertices) < 3:
+                continue
+            path = MplPath(vertices)
+            mask |= path.contains_points(points, radius=0.5).reshape((height, width))
         return mask
 
     def _map_intensity_range_values(self) -> tuple[float, float]:
@@ -2162,8 +2447,7 @@ plt.show()
         ax = self.snapshot_hist_canvas.reset_axis()
         image = self._current_snapshot_display_image()
         if image is None or image.size == 0:
-            ax.text(0.5, 0.5, "Load a snapshot stack to inspect intensity histogram", ha="center", va="center")
-            ax.set_axis_off()
+            self._set_empty_axis_message(ax, "Load a snapshot stack to inspect intensity histogram")
             self.snapshot_z_min_label.setText("Z min: -")
             self.snapshot_z_max_label.setText("Z max: -")
             self.snapshot_hist_canvas.draw_idle()
@@ -2227,11 +2511,13 @@ plt.show()
 
     def _reset_map_histogram_controls(self, preserve_mask_range: bool = False):
         image = self._map_intensity_image()
-        polygon_mask = self._current_polygon_mask()
-        if image is None or polygon_mask is None or not polygon_mask.any():
+        if image is None:
             return
         previous_min, previous_max = self._map_intensity_range_values()
-        values = image[polygon_mask]
+        values = np.asarray(image, dtype=float).ravel()
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return
         self._map_intensity_min = float(np.min(values))
         self._map_intensity_max = float(np.max(values))
         if preserve_mask_range:
@@ -2243,13 +2529,16 @@ plt.show()
     def _update_map_histogram(self):
         ax = self.map_hist_canvas.reset_axis()
         image = self._map_intensity_image()
-        polygon_mask = self._current_polygon_mask()
-        if image is None or polygon_mask is None or not polygon_mask.any():
-            ax.text(0.5, 0.5, "Draw a polygon ROI to inspect intensity histogram", ha="center", va="center")
-            ax.set_axis_off()
+        if image is None:
+            self._set_empty_axis_message(ax, "Load a 2D map to inspect intensity histogram")
             self.map_hist_canvas.draw_idle()
             return
-        values = image[polygon_mask]
+        values = np.asarray(image, dtype=float).ravel()
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            self._set_empty_axis_message(ax, "No finite map intensities available")
+            self.map_hist_canvas.draw_idle()
+            return
         ax.hist(
             values,
             bins=64,
@@ -2260,7 +2549,7 @@ plt.show()
         z_min, z_max = self._map_intensity_range_values()
         ax.axvline(z_min, color=PLOT_PREVIEW, linewidth=1.2)
         ax.axvline(z_max, color=PLOT_FIT, linewidth=1.2)
-        ax.set_title("Polygon intensity histogram")
+        ax.set_title("Map intensity histogram")
         ax.set_xlabel("Integrated intensity")
         ax.set_ylabel("Pixels")
         self.map_mask_min_label.setText(f"Mask min: {z_min:.2f}")
@@ -2320,8 +2609,7 @@ plt.show()
         image = self._map_intensity_image()
         polygon_mask = self._current_polygon_mask()
         if image is None or polygon_mask is None:
-            ax.text(0.5, 0.5, "Masked image", ha="center", va="center")
-            ax.set_axis_off()
+            self._set_empty_axis_message(ax, "Masked image")
             self.corrected_canvas.draw_idle()
             return
         z_min, z_max = self._map_intensity_range_values()
@@ -2350,25 +2638,16 @@ plt.show()
 
     def _clear_corrected_preview(self, message: str):
         ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
-        ax.text(0.5, 0.5, message, ha="center", va="center")
-        ax.set_axis_off()
+        self._set_empty_axis_message(ax, message)
         self.corrected_canvas.draw_idle()
 
     def _draw_initial_image(self):
-        preserve_view = (
-            self.loaded is not None
-            and self._current_mode_index() == 1
-            and self._image_view_limits is not None
-        )
-        if preserve_view and self.image_canvas.figure.axes:
-            current_ax = self.image_canvas.figure.axes[0]
-            self._image_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
+        self._capture_current_image_view()
 
         self._detach_selector()
         ax = self._prepare_image_axis(self.image_canvas.reset_axis())
         if self.loaded is None:
-            ax.text(0.5, 0.5, "Load an EELS dataset to start", ha="center", va="center")
-            ax.set_axis_off()
+            self._set_empty_axis_message(ax, "Load an EELS dataset to start")
             self.image_canvas.draw_idle()
             self._clear_corrected_preview("Load data and run alignment to preview corrected output")
             return
@@ -2436,84 +2715,68 @@ plt.show()
 
     def _sync_selector_state(self):
         if self.selector is not None:
-            self.selector.set_active(self.enable_selector.isChecked())
+            self.selector.set_active(self._mouse_mode == "roi")
 
     def _on_polygon_selected(self, verts):
         if self._current_mode_index() != 0:
             return
-        self.map_polygon_vertices = [(float(x), float(y)) for x, y in verts]
+        vertices = [(float(x), float(y)) for x, y in verts]
+        if len(vertices) >= 3:
+            self.map_polygon_vertices.append(vertices)
         self._reset_map_histogram_controls(preserve_mask_range=True)
         self._draw_initial_image()
 
     def _on_rectangle_selected(self, eclick, erelease):
+        if self._current_mode_index() == 0:
+            return
         if eclick.ydata is None or erelease.ydata is None:
             return
         y0, y1 = sorted([int(round(eclick.ydata)), int(round(erelease.ydata))])
-        if self._current_mode_index() == 0:
-            if eclick.xdata is None or erelease.xdata is None:
-                return
-            x0, x1 = sorted([int(round(eclick.xdata)), int(round(erelease.xdata))])
-            self.roi_x0.blockSignals(True)
-            self.roi_x1.blockSignals(True)
-            self.roi_y0.blockSignals(True)
-            self.roi_y1.blockSignals(True)
-            self.roi_x0.setValue(x0)
-            self.roi_x1.setValue(max(x0 + 1, x1))
-            self.roi_y0.setValue(y0)
-            self.roi_y1.setValue(max(y0 + 1, y1))
-            self.roi_x0.blockSignals(False)
-            self.roi_x1.blockSignals(False)
-            self.roi_y0.blockSignals(False)
-            self.roi_y1.blockSignals(False)
-        else:
-            self.stack_y0.blockSignals(True)
-            self.stack_y1.blockSignals(True)
-            self.stack_y0.setValue(y0)
-            self.stack_y1.setValue(max(y0 + 1, y1))
-            self.stack_y0.blockSignals(False)
-            self.stack_y1.blockSignals(False)
+        self.stack_y0.blockSignals(True)
+        self.stack_y1.blockSignals(True)
+        self.stack_y0.setValue(y0)
+        self.stack_y1.setValue(max(y0 + 1, y1))
+        self.stack_y0.blockSignals(False)
+        self.stack_y1.blockSignals(False)
         self._update_selection_overlay()
 
     def _update_selection_overlay(self):
         axes = self.image_canvas.figure.axes
         if not axes:
             return
+        if self._current_mode_index() == 1:
+            self._capture_current_image_view()
         ax = axes[0]
         if self.selection_rect is not None:
             try:
                 self.selection_rect.remove()
             except Exception:
                 pass
-        if self.selection_polygon is not None:
+        for selection_polygon in self.selection_polygons:
             try:
-                self.selection_polygon.remove()
+                selection_polygon.remove()
             except Exception:
                 pass
+        self.selection_polygons = []
         if self._current_mode_index() == 0:
-            polygon_mask = self._current_polygon_mask()
-            if self.map_polygon_vertices is None and polygon_mask is not None:
-                height, width = polygon_mask.shape
-                self.map_polygon_vertices = self._default_map_polygon(width, height)
-            if self.map_polygon_vertices:
-                self.selection_polygon = Polygon(
-                    self.map_polygon_vertices,
+            for vertices in self.map_polygon_vertices:
+                selection_polygon = Polygon(
+                    vertices,
                     closed=True,
                     fill=False,
                     edgecolor=PLOT_PREVIEW,
                     linewidth=1.5,
                 )
-                ax.add_patch(self.selection_polygon)
+                ax.add_patch(selection_polygon)
+                self.selection_polygons.append(selection_polygon)
             self.image_canvas.draw_idle()
+            self._update_clear_roi_button_enabled()
             return
         else:
-            x0 = 0
-            if self.loaded is not None:
-                x1 = int(self.loaded.eels_signal.data.shape[2])
-            else:
-                x1 = int(round(max(ax.get_xlim())))
+            x0, x1 = ax.get_xlim()
             y0 = self.stack_y0.value()
             y1 = self.stack_y1.value()
-        width = max(1, x1 - x0)
+        width = x1 - x0
         height = max(1, y1 - y0)
         self.selection_rect = Rectangle((x0, y0), width, height, fill=False, edgecolor=PLOT_PREVIEW, linewidth=1.5)
         ax.add_patch(self.selection_rect)
@@ -2535,11 +2798,13 @@ plt.show()
     def _show_previous_snapshot(self):
         if not self.snapshot_index_spin.isEnabled():
             return
+        self._capture_current_image_view()
         self.snapshot_index_spin.setValue(max(0, self.snapshot_index_spin.value() - 1))
 
     def _show_next_snapshot(self):
         if not self.snapshot_index_spin.isEnabled():
             return
+        self._capture_current_image_view()
         self.snapshot_index_spin.setValue(
             min(self.snapshot_index_spin.maximum(), self.snapshot_index_spin.value() + 1)
         )
@@ -2786,10 +3051,10 @@ plt.show()
             ax0.set_ylabel("")
             for row, entry in preview_entries:
                 color = self._saved_map_entry_color(row)
-                if entry.polygon_vertices:
+                for vertices in self._entry_polygon_list(entry):
                     ax0.add_patch(
                         Polygon(
-                            entry.polygon_vertices,
+                            vertices,
                             closed=True,
                             fill=False,
                             edgecolor=color,
@@ -2983,11 +3248,9 @@ plt.show()
         y_min = min(y0, y1)
         y_max = max(y0, y1)
 
-        # Ignore stale/default limits such as (0, 1) or limits fully outside the image.
+        # Ignore limits fully outside the image. Tight zoom windows are valid user state.
         if (
-            (x_max - x_min) < 2
-            or (y_max - y_min) < 2
-            or x_max < 0
+            x_max < 0
             or x_min > (x_size - 1)
             or y_max < 0
             or y_min > (y_size - 1)
@@ -3006,6 +3269,8 @@ plt.show()
 
     def _on_snapshot_index_changed(self):
         if self._current_mode_index() == 1:
+            self._capture_current_image_view()
+            self._capture_current_corrected_view()
             self._reset_snapshot_histogram_controls(preserve_range=True)
         self._update_view_for_active_tab()
 
@@ -3028,7 +3293,7 @@ plt.show()
         frame_offset = max(0, frame_offset)
         return aligned_stack[frame_offset].sum(axis=0)
 
-    def _current_snapshot_aligned_image(self) -> Optional[np.ndarray]:
+    def _current_snapshot_aligned_image(self, full_detector: bool = False) -> Optional[np.ndarray]:
         if (
             self.loaded is None
             or self._current_mode_index() != 1
@@ -3040,7 +3305,17 @@ plt.show()
             return None
         frame_offset = min(self.snapshot_index_spin.value() - self.frame_start.value(), aligned_stack.shape[0] - 1)
         frame_offset = max(0, frame_offset)
-        return aligned_stack[frame_offset]
+        aligned_image = aligned_stack[frame_offset]
+        if not full_detector:
+            return aligned_image
+        detector_shape = np.asarray(self.loaded.eels_signal.data[self.snapshot_index_spin.value()]).shape
+        full_image = np.full(detector_shape, np.nan, dtype=float)
+        y0, y1 = self.current_result.vertical_range
+        row_stop = min(y1, detector_shape[0], y0 + aligned_image.shape[0])
+        col_stop = min(detector_shape[1], aligned_image.shape[1])
+        if row_stop > y0 and col_stop > 0:
+            full_image[y0:row_stop, :col_stop] = aligned_image[: row_stop - y0, :col_stop]
+        return full_image
 
     def _fit_window(self):
         return (self.fit_start_spin.value(), self.fit_stop_spin.value())
@@ -3088,13 +3363,12 @@ plt.show()
         return None
 
     def _render_result(self, result):
-        if isinstance(result, StackProcessingResult) and self.image_canvas.figure.axes:
-            current_ax = self.image_canvas.figure.axes[0]
-            self._image_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
-        self._detach_selector()
-        image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
+        if isinstance(result, StackProcessingResult):
+            self._capture_current_image_view()
 
         if isinstance(result, MapProcessingResult):
+            self._detach_selector()
+            image_ax = self._prepare_image_axis(self.image_canvas.reset_axis())
             z_min, z_max = self._map_image_display_limits()
             im = image_ax.imshow(result.intensity_image, cmap="inferno", origin="upper", vmin=z_min, vmax=z_max)
             divider = make_axes_locatable(image_ax)
@@ -3106,42 +3380,18 @@ plt.show()
             cal_axis = result.energy_axis_calibrated
             image_ax.set_xlabel("")
             image_ax.set_ylabel("")
+            self.image_canvas.draw_idle()
+            self._attach_selector()
+            self._update_selection_overlay()
         else:
-            frame_index = min(self.snapshot_index_spin.value(), self.loaded.eels_signal.data.shape[0] - 1)
-            detector_image = self.loaded.eels_signal.data[frame_index]
-            z_min, z_max = self._snapshot_image_display_limits()
-            image_ax.imshow(detector_image, cmap="viridis", origin="upper", aspect="auto", vmin=z_min, vmax=z_max)
-            band_height = max(1, self.stack_y1.value() - self.stack_y0.value())
-            image_ax.add_patch(
-                Rectangle(
-                    (0, self.stack_y0.value()),
-                    detector_image.shape[1],
-                    band_height,
-                    edgecolor=PLOT_PREVIEW,
-                    fill=False,
-                    linewidth=1.5,
-                )
-            )
-            self._apply_saved_image_view(image_ax, detector_image.shape[1], detector_image.shape[0])
-            image_ax.set_title(f"Snapshot {frame_index}")
             pixel_count_text = str(result.aligned_stack.shape[0] * result.aligned_stack.shape[1])
             cal_axis = result.energy_axis_calibrated
-            image_ax.set_xlabel("")
-            image_ax.set_ylabel("")
-
-        self.image_canvas.draw_idle()
-        self._image_view_limits = (image_ax.get_xlim(), image_ax.get_ylim())
-        if isinstance(result, StackProcessingResult):
-            image_ax.callbacks.connect("xlim_changed", self._sync_corrected_x_from_image)
-        self._attach_selector()
-        self._update_selection_overlay()
 
         if isinstance(result, StackProcessingResult) and self.corrected_canvas.figure.axes:
-            current_ax = self.corrected_canvas.figure.axes[0]
-            self._corrected_view_limits = (current_ax.get_xlim(), current_ax.get_ylim())
+            self._capture_current_corrected_view()
         corrected_ax = self._prepare_image_axis(self.corrected_canvas.reset_axis())
         if isinstance(result, StackProcessingResult):
-            corrected_image = self._current_snapshot_aligned_image()
+            corrected_image = self._current_snapshot_aligned_image(full_detector=True)
             if corrected_image is not None:
                 z_min, z_max = self._snapshot_image_display_limits()
                 corrected_ax.imshow(corrected_image, cmap="viridis", origin="upper", aspect="auto", vmin=z_min, vmax=z_max)
@@ -3153,10 +3403,10 @@ plt.show()
                     corrected_image.shape[1],
                     corrected_image.shape[0],
                 )
-                self._match_corrected_x_to_image(corrected_ax, corrected_image.shape[1])
+                corrected_ax.callbacks.connect("xlim_changed", self._on_corrected_view_changed)
+                corrected_ax.callbacks.connect("ylim_changed", self._on_corrected_view_changed)
             else:
-                corrected_ax.text(0.5, 0.5, "No corrected image", ha="center", va="center")
-                corrected_ax.set_axis_off()
+                self._set_empty_axis_message(corrected_ax, "No corrected image")
         else:
             masked = np.ma.masked_invalid(result.masked_image)
             z_min, z_max = self._map_image_display_limits()
@@ -3282,9 +3532,7 @@ plt.show()
         y_max = max(y0, y1)
 
         if (
-            (x_max - x_min) < 2
-            or (y_max - y_min) < 2
-            or x_max < 0
+            x_max < 0
             or x_min > (x_size - 1)
             or y_max < 0
             or y_min > (y_size - 1)
@@ -3300,6 +3548,12 @@ plt.show()
         y1 = min(max(y1, 0), y_size - 1)
         ax.set_xlim(x0, x1)
         ax.set_ylim(y0, y1)
+
+    def _on_corrected_view_changed(self, corrected_ax):
+        if self._syncing_corrected_xlim:
+            return
+        if corrected_ax.images:
+            self._corrected_view_limits = (corrected_ax.get_xlim(), corrected_ax.get_ylim())
 
     def _match_corrected_x_to_image(self, corrected_ax, corrected_width: int):
         if not self.image_canvas.figure.axes:
@@ -3334,6 +3588,13 @@ plt.show()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("vibeels")
+    app.setDesktopFileName("vibeels")
+    icon_path = _application_icon_path()
+    icon = _application_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
+    _set_macos_dock_icon(icon_path)
     apply_qt_theme(app)
     window = VibeelsWindow()
     window.show()

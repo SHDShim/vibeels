@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,11 +11,12 @@ requires-python = ">=3.10"
 authors = [
   { name = "Dan Shim" }
 ]
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["eels", "hyperspy", "pyqt", "spectroscopy", "vibrational-eels"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
-  "License :: Other/Proprietary License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -32,7 +33,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://pypi.org/project/vibeels/"
+Homepage = "https://github.com/danshim/vibeels"
+Repository = "https://github.com/danshim/vibeels"
+Issues = "https://github.com/danshim/vibeels/issues"
+Changelog = "https://github.com/danshim/vibeels/blob/main/CHANGELOG.md"
 
 [project.scripts]
 vibeels = "vibeels.app:main"
@@ -42,3 +46,6 @@ version = { attr = "vibeels.version.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["vibeels*"]
+
+[tool.setuptools.package-data]
+vibeels = ["assets/icons/*.png"]

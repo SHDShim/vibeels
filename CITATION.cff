@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use vibeels in your research, please cite this software."
+title: "vibeels: vibrational EELS spectrum extraction and zero-loss calibration"
+version: 0.3.0
+date-released: 2026-05-04
+authors:
+  - family-names: Shim
+    given-names: Dan
+repository-code: "https://github.com/danshim/vibeels"
+license: MIT
+keywords:
+  - EELS
+  - vibrational spectroscopy
+  - HyperSpy
+  - PyQt
+  - zero-loss calibration

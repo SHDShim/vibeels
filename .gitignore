@@ -1,40 +1,80 @@
-# Python bytecode
+# Byte-compiled files and Python caches
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Build artifacts
+# Python packaging and build outputs
+*.egg-info/
 build/
 dist/
-*.egg-info/
-.eggs/
+sdist/
+wheels/
+pip-wheel-metadata/
+*.egg
+MANIFEST
 
-# Virtual environments
+# Test, coverage, and static-analysis outputs
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+
+# Virtual environments and local dependency directories
 .venv/
 venv/
 env/
 ENV/
+.env/
+.conda/
 
-# Test and coverage output
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 
-# Type checker / linter caches
-.mypy_cache/
-.ruff_cache/
-.pyre/
-
-# Jupyter
+# Jupyter and notebook checkpoints
 .ipynb_checkpoints/
 
-# OS / editor files
-.DS_Store
-.idea/
+# IDE and editor state
 .vscode/
-.vscode/**
+.idea/
+*.swp
+*.swo
+*~
 
-# Local app/output artifacts
-vibeels-analysis/
+# OS metadata
+.DS_Store
+._*
+Thumbs.db
+
+# Logs and runtime state
 *.log
+*.pid
+*.seed
+
+# Generated analysis outputs and local scientific data
+vibeels-analysis/
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.dm3
+*.dm4
+
+# Keep generated application icons under version control.
+!asset/**/*.png
+!asset/**/*.ico
+!asset/**/*.icns
+!vibeels/assets/icons/*.png
