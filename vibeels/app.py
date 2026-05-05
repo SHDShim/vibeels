@@ -849,7 +849,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
         load_eels = self._make_button("Load EELS DM3/DM4", self._load_eels, variant="success")
         refresh = self._make_button("Process Current Settings", self._process_current, variant="danger")
-        save_state = self._make_button("Save status", self._save_session_state)
+        save_state = self._make_button("Save status and vxy (vibfit)", self._save_session_state)
         load_state = self._make_button("Restore status", self._load_selected_session_state)
 
         self.shape_label = QtWidgets.QLabel("-")
@@ -863,7 +863,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         state_buttons = QtWidgets.QHBoxLayout()
         state_buttons.addWidget(save_state, 1)
         state_buttons.addWidget(load_state, 1)
-        layout.addRow("Saved states", state_buttons)
+        layout.addRow(state_buttons)
 
         self.saved_state_table = QtWidgets.QTableWidget(0, 3)
         self.saved_state_table.setHorizontalHeaderLabels(["Folder", "Timestamp", "Comment"])
@@ -922,7 +922,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
         self.normalize_saved_spectra_checkbox = QtWidgets.QCheckBox("Normalize spectra intensity")
         self.normalize_saved_spectra_checkbox.toggled.connect(self._update_view_for_active_tab)
-        export_button = self._make_button("Export NPY", self._save_results)
+        export_button = self._make_button("Export, NPY, PDF, and PNG", self._save_results)
         self.title_font_size_combo = QtWidgets.QComboBox()
         for size in range(8, 31, 2):
             self.title_font_size_combo.addItem(str(size), size)
