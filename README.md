@@ -110,7 +110,7 @@ python -m twine check dist/*
 ## Release Metadata
 
 - Package name: `vibeels`
-- Current version: `0.3.0`
+- Current version: `0.3.1`
 - Repository: <https://github.com/shdshim/vibeels>
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 

@@ -2,6 +2,12 @@
 
 All notable changes to `vibeels` are documented here.
 
+## 0.3.1 - 2026-05-05
+
+### Changed
+
+- Updated button labels for clearer application workflow guidance.
+
 ## 0.3.0 - 2026-05-04
 
 ### Added
