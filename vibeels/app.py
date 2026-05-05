@@ -19,7 +19,7 @@ matplotlib.use("QtAgg")
 import numpy as np
 from matplotlib import rcParams, ticker
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.patches import Polygon, Rectangle
 from matplotlib.path import Path as MplPath
@@ -62,6 +62,36 @@ SelectionMode = QtWidgets.QAbstractItemView.SelectionMode
 MessageBoxButton = QtWidgets.QMessageBox.StandardButton
 
 configure_matplotlib_defaults()
+
+
+class AxisConstrainedNavigationToolbar(NavigationToolbar2QT):
+    def _active_axis_zoom_key(self, event) -> Optional[str]:
+        key = getattr(event, "key", None)
+        if key in {"x", "y"}:
+            return key
+        parent = self.parent()
+        key = getattr(parent, "_pressed_axis_zoom_key", None)
+        return key if key in {"x", "y"} else None
+
+    def _with_axis_zoom_key(self, event, callback):
+        key = self._active_axis_zoom_key(event)
+        if key is None:
+            return callback(event)
+        original_key = getattr(event, "key", None)
+        event.key = key
+        try:
+            return callback(event)
+        finally:
+            event.key = original_key
+
+    def drag_zoom(self, event):
+        return self._with_axis_zoom_key(event, super().drag_zoom)
+
+    def release_zoom(self, event):
+        return self._with_axis_zoom_key(event, super().release_zoom)
+
+
+NavigationToolbar = AxisConstrainedNavigationToolbar
 
 
 def _application_icon_path() -> Optional[Path]:
@@ -380,9 +410,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self._snapshot_intensity_min = 0.0
         self._snapshot_intensity_max = 1.0
         self._active_snapshot_histogram_handle: Optional[str] = None
+        self._snapshot_histogram_zoom_start: Optional[tuple[float, float, str]] = None
         self._plot_toolbars: dict[FigureCanvas, NavigationToolbar] = {}
         self._mouse_mode = "zoom"
         self._main_canvas_mouse_cids: list[tuple[FigureCanvas, int]] = []
+        self._pressed_axis_zoom_key: Optional[str] = None
 
         self._build_ui()
         self._apply_default_ranges()
@@ -454,6 +486,68 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self._plot_toolbars[canvas] = toolbar
         return toolbar
 
+    def _prepare_interactive_canvas(self, canvas: FigureCanvas) -> None:
+        canvas.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        canvas.installEventFilter(self)
+
+    def _update_axis_zoom_key_from_qt_event(self, event, pressed: bool) -> None:
+        if event.isAutoRepeat():
+            return
+        if event.key() == QtCore.Qt.Key.Key_X:
+            self._pressed_axis_zoom_key = "x" if pressed else None
+        elif event.key() == QtCore.Qt.Key.Key_Y:
+            self._pressed_axis_zoom_key = "y" if pressed else None
+
+    def eventFilter(self, watched, event):
+        if event.type() == QtCore.QEvent.Type.KeyPress:
+            self._update_axis_zoom_key_from_qt_event(event, pressed=True)
+        elif event.type() == QtCore.QEvent.Type.KeyRelease:
+            self._update_axis_zoom_key_from_qt_event(event, pressed=False)
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event):
+        self._update_axis_zoom_key_from_qt_event(event, pressed=True)
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        self._update_axis_zoom_key_from_qt_event(event, pressed=False)
+        super().keyReleaseEvent(event)
+
+    def _axis_zoom_key(self, *events) -> Optional[str]:
+        if self._pressed_axis_zoom_key in {"x", "y"}:
+            return self._pressed_axis_zoom_key
+        for event in events:
+            key = getattr(event, "key", None)
+            if key in {"x", "y"}:
+                return key
+        return None
+
+    def _roi_mode_zoom_canvases(self) -> set[FigureCanvas]:
+        if self._current_mode_index() == 1:
+            return {self.corrected_canvas, self.fit_canvas, self.spectrum_canvas}
+        return {self.fit_canvas, self.spectrum_canvas}
+
+    def _zoom_canvas_axis_from_pixels(
+        self,
+        canvas: FigureCanvas,
+        toolbar: Optional[NavigationToolbar],
+        start_xy: tuple[float, float],
+        end_xy: tuple[float, float],
+        key: str,
+    ) -> None:
+        if not canvas.figure.axes or key not in {"x", "y"}:
+            return
+        start_x, start_y = start_xy
+        end_x, end_y = end_xy
+        if (key == "x" and abs(end_x - start_x) < 5) or (key == "y" and abs(end_y - start_y) < 5):
+            canvas.draw_idle()
+            return
+        axis = canvas.figure.axes[0]
+        axis._set_view_from_bbox((start_x, start_y, end_x, end_y), "in", key, False, False)
+        if toolbar is not None:
+            toolbar.push_current()
+        canvas.draw_idle()
+
     def _style_mouse_mode_buttons(self) -> None:
         self.zoom_button.setStyleSheet(
             """
@@ -520,6 +614,11 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         if mode == "zoom":
             for toolbar in self._plot_toolbars.values():
                 toolbar.zoom()
+        else:
+            for canvas in self._roi_mode_zoom_canvases():
+                toolbar = self._plot_toolbars.get(canvas)
+                if toolbar is not None:
+                    toolbar.zoom()
         self._sync_selector_state()
 
     def _connect_main_canvas_mouse_events(self) -> None:
@@ -528,11 +627,20 @@ class VibeelsWindow(QtWidgets.QMainWindow):
             self._main_canvas_mouse_cids.append((canvas, cid))
 
     def _on_main_canvas_button_press(self, event) -> None:
-        if event.button == 3 and self._mouse_mode == "zoom":
+        if event.button == 3 and (
+            self._mouse_mode == "zoom"
+            or (
+                self._mouse_mode == "roi"
+                and event.canvas in self._roi_mode_zoom_canvases()
+            )
+        ):
             self._reset_canvas_view(event.canvas)
             return
 
         if self._mouse_mode != "roi":
+            return
+
+        if event.canvas in self._roi_mode_zoom_canvases():
             return
 
         if event.canvas is not self.image_canvas:
@@ -785,16 +893,19 @@ class VibeelsWindow(QtWidgets.QMainWindow):
 
         image_panel = QtWidgets.QVBoxLayout()
         self.image_canvas = PlotCanvas((1, 1), self)
+        self._prepare_interactive_canvas(self.image_canvas)
         self.image_toolbar = self._make_plot_toolbar(self.image_canvas)
         image_panel.addWidget(self.image_canvas, 1)
 
         corrected_panel = QtWidgets.QVBoxLayout()
         self.corrected_canvas = PlotCanvas((1, 1), self)
+        self._prepare_interactive_canvas(self.corrected_canvas)
         self.corrected_toolbar = self._make_plot_toolbar(self.corrected_canvas)
         corrected_panel.addWidget(self.corrected_canvas, 1)
 
         fit_panel = QtWidgets.QVBoxLayout()
         self.fit_canvas = PlotCanvas((1, 1), self)
+        self._prepare_interactive_canvas(self.fit_canvas)
         self.fit_toolbar = self._make_plot_toolbar(self.fit_canvas)
         fit_panel.addWidget(self.fit_canvas, 1)
 
@@ -804,6 +915,7 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         left_layout.addLayout(top_row, 1)
 
         self.spectrum_canvas = PlotCanvas((1, 1), self)
+        self._prepare_interactive_canvas(self.spectrum_canvas)
         self.spectrum_toolbar = self._make_plot_toolbar(self.spectrum_canvas)
         left_layout.addWidget(self.spectrum_canvas, 1)
         self._connect_main_canvas_mouse_events()
@@ -1041,6 +1153,8 @@ class VibeelsWindow(QtWidgets.QMainWindow):
         self.snapshot_hist_log_checkbox.toggled.connect(self._update_snapshot_histogram)
         self.snapshot_hist_canvas = PlotCanvas((1, 1), self)
         self.snapshot_hist_canvas.setMinimumHeight(126)
+        self._prepare_interactive_canvas(self.snapshot_hist_canvas)
+        self.snapshot_hist_toolbar = self._make_plot_toolbar(self.snapshot_hist_canvas)
         self.snapshot_hist_canvas.mpl_connect("button_press_event", self._on_snapshot_histogram_press)
         self.snapshot_hist_canvas.mpl_connect("motion_notify_event", self._on_snapshot_histogram_move)
         self.snapshot_hist_canvas.mpl_connect("button_release_event", self._on_snapshot_histogram_release)
@@ -2493,6 +2607,11 @@ plt.show()
             return
         if event.button != 1:
             return
+        key = self._axis_zoom_key(event)
+        if self._current_mode_index() == 1 and key in {"x", "y"}:
+            self._snapshot_histogram_zoom_start = (float(event.x), float(event.y), key)
+            self._active_snapshot_histogram_handle = None
+            return
         handle = self._snapshot_histogram_handle_at(event.xdata)
         if handle is None:
             return
@@ -2500,13 +2619,27 @@ plt.show()
         self._set_snapshot_histogram_handle_from_x(handle, event.xdata)
 
     def _on_snapshot_histogram_move(self, event):
+        if self._snapshot_histogram_zoom_start is not None:
+            return
         if self._active_snapshot_histogram_handle is None:
             return
         if event.inaxes is None or event.inaxes not in self.snapshot_hist_canvas.figure.axes:
             return
         self._set_snapshot_histogram_handle_from_x(self._active_snapshot_histogram_handle, event.xdata)
 
-    def _on_snapshot_histogram_release(self, _event):
+    def _on_snapshot_histogram_release(self, event):
+        if self._snapshot_histogram_zoom_start is not None:
+            start_x, start_y, key = self._snapshot_histogram_zoom_start
+            self._snapshot_histogram_zoom_start = None
+            if getattr(event, "x", None) is not None and getattr(event, "y", None) is not None:
+                self._zoom_canvas_axis_from_pixels(
+                    self.snapshot_hist_canvas,
+                    self.snapshot_hist_toolbar,
+                    (start_x, start_y),
+                    (float(event.x), float(event.y)),
+                    key,
+                )
+            return
         self._active_snapshot_histogram_handle = None
 
     def _reset_map_histogram_controls(self, preserve_mask_range: bool = False):
@@ -2726,8 +2859,40 @@ plt.show()
         self._reset_map_histogram_controls(preserve_mask_range=True)
         self._draw_initial_image()
 
+    def _zoom_image_axis_from_rectangle(self, eclick, erelease) -> bool:
+        if self._current_mode_index() == 0:
+            return False
+        key = self._pressed_axis_zoom_key
+        if key not in {"x", "y"}:
+            for event in (erelease, eclick):
+                event_key = getattr(event, "key", None)
+                if event_key in {"x", "y"}:
+                    key = event_key
+                    break
+        if key not in {"x", "y"}:
+            return False
+        if not self.image_canvas.figure.axes:
+            return True
+        if any(getattr(event, attr, None) is None for event in (eclick, erelease) for attr in ("x", "y")):
+            return True
+
+        start_x, start_y = float(eclick.x), float(eclick.y)
+        end_x, end_y = float(erelease.x), float(erelease.y)
+        self._zoom_canvas_axis_from_pixels(
+            self.image_canvas,
+            self.image_toolbar,
+            (start_x, start_y),
+            (end_x, end_y),
+            key,
+        )
+        self._capture_current_image_view()
+        self._update_selection_overlay()
+        return True
+
     def _on_rectangle_selected(self, eclick, erelease):
         if self._current_mode_index() == 0:
+            return
+        if self._zoom_image_axis_from_rectangle(eclick, erelease):
             return
         if eclick.ydata is None or erelease.ydata is None:
             return
